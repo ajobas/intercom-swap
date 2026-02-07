@@ -60,12 +60,7 @@ Recommended:
 - OpenAI: **GPT-5.3+** (Codex, `xhigh`)
 - Anthropic: **Claude Opus 4.6+**
 
-Local/open-weight models can work too, but use a high-grade one (aim for at least an "M2-class" model or better, and always run the full test suite):
-- Moonshot: **Kimi K2.5+**
-- MiniMax: **MiniMax-M2.1+**
-- Any comparable-or-stronger model is fine
-
-Note: "M2" is a MiniMax model family name; Moonshot Kimi uses the K2/K2.5 naming.
+Local/open-weight models can work too, but use a high-grade one.
 
 ---
 
