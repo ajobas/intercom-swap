@@ -15,7 +15,7 @@ import {
   normalizeWelcomePayload,
   toB64Json,
 } from '../src/sidechannel/capabilities.js';
-import { Connection } from '@solana/web3.js';
+import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 
 function die(msg) {
   process.stderr.write(`${msg}\n`);
@@ -59,7 +59,7 @@ Swap message helpers (signed swap envelopes, sent over sidechannels):
   accept --channel <swapChannel> --trade-id <id> (--terms-hash <hex> | --terms-json <envelope|@file>)
 
 Verification helpers:
-  verify-prepay --terms-json <envelope|body|@file> --invoice-json <envelope|body|@file> --escrow-json <envelope|body|@file> [--now-unix <sec>] [--solana-rpc-url <url>] [--solana-commitment <confirmed|finalized|processed>]
+  verify-prepay --terms-json <envelope|body|@file> --invoice-json <envelope|body|@file> --escrow-json <envelope|body|@file> [--now-unix <sec>] [--solana-rpc-url <url[,url2,...]>] [--solana-commitment <confirmed|finalized|processed>]
 
 Notes:
   - This tool never touches private keys; it asks the peer to sign via SC-Bridge.
@@ -254,15 +254,19 @@ async function main() {
       : 'confirmed';
 
     if (rpcUrlRaw) {
-      const connection = new Connection(rpcUrlRaw, commitmentRaw);
-      const res = await verifySwapPrePayOnchain({
-        terms,
-        invoiceBody,
-        escrowBody,
-        connection,
-        commitment: commitmentRaw,
-        now_unix: nowUnix,
-      });
+      const pool = new SolanaRpcPool({ rpcUrls: rpcUrlRaw, commitment: commitmentRaw });
+      const res = await pool.call(
+        async (connection) =>
+          await verifySwapPrePayOnchain({
+            terms,
+            invoiceBody,
+            escrowBody,
+            connection,
+            commitment: commitmentRaw,
+            now_unix: nowUnix,
+          }),
+        { label: 'verify-prepay' }
+      );
       process.stdout.write(`${JSON.stringify(res, null, 2)}\n`);
       return;
     }

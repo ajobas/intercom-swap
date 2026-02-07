@@ -5,13 +5,14 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import {
   createAssociatedTokenAccount,
   getAccount,
   getAssociatedTokenAddress,
 } from '@solana/spl-token';
 
+import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { ScBridgeClient } from '../src/sc-bridge/client.js';
 import { createUnsignedEnvelope, attachSignature } from '../src/protocol/signedMessage.js';
 import { KIND, ASSET, PAIR, STATE } from '../src/swap/constants.js';
@@ -276,10 +277,10 @@ async function main() {
   const sol = runSwap
     ? (() => {
         const payer = readSolanaKeypair(solKeypairPath);
-        const connection = new Connection(solRpcUrl, 'confirmed');
+        const pool = new SolanaRpcPool({ rpcUrls: solRpcUrl, commitment: 'confirmed' });
         const mint = new PublicKey(solMintStr);
         const programId = solProgramIdStr ? new PublicKey(solProgramIdStr) : LN_USDT_ESCROW_PROGRAM_ID;
-        return { payer, connection, mint, programId };
+        return { payer, pool, mint, programId };
       })()
     : null;
 
@@ -459,21 +460,28 @@ async function main() {
     if (!Number.isFinite(refundAfterUnix) || refundAfterUnix <= 0) throw new Error('Invalid sol_refund_after_unix');
 
     const solRecipient = new PublicKey(ctx.solRecipient);
-    const payerToken = await ensureAta({ connection: sol.connection, payer: sol.payer, mint: sol.mint, owner: sol.payer.publicKey });
+    const payerToken = await sol.pool.call(
+      (connection) => ensureAta({ connection, payer: sol.payer, mint: sol.mint, owner: sol.payer.publicKey }),
+      { label: 'maker:ensure-ata' }
+    );
 
-    const { tx: escrowTx, escrowPda, vault } = await createEscrowTx({
-      connection: sol.connection,
-      payer: sol.payer,
-      payerTokenAccount: payerToken,
-      mint: sol.mint,
-      paymentHashHex,
-      recipient: solRecipient,
-      refund: sol.payer.publicKey,
-      refundAfterUnix,
-      amount: BigInt(String(ctx.usdtAmount)),
-      programId: sol.programId,
-    });
-    const escrowSig = await sendAndConfirm(sol.connection, escrowTx);
+    const { tx: escrowTx, escrowPda, vault } = await sol.pool.call(
+      (connection) =>
+        createEscrowTx({
+          connection,
+          payer: sol.payer,
+          payerTokenAccount: payerToken,
+          mint: sol.mint,
+          paymentHashHex,
+          recipient: solRecipient,
+          refund: sol.payer.publicKey,
+          refundAfterUnix,
+          amount: BigInt(String(ctx.usdtAmount)),
+          programId: sol.programId,
+        }),
+      { label: 'maker:build-escrow-tx' }
+    );
+    const escrowSig = await sol.pool.call((connection) => sendAndConfirm(connection, escrowTx), { label: 'maker:send-escrow-tx' });
 
     const solEscrowUnsigned = createUnsignedEnvelope({
       v: 1,

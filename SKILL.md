@@ -1034,7 +1034,13 @@ Bitcoin (Esplora-compatible explorer APIs):
 - mempool.space: `https://mempool.space/api/` (mainnet) and similar paths for test networks (verify before relying on them)
   - Many Esplora APIs support raw-tx broadcast via `POST /tx` (send hex in request body), but you must verify per endpoint before production use.
 
-Hard rule for production: endpoints MUST be user-configurable (comma-separated list, failover on errors). For real reliability, use your own RPC or a paid provider.
+Hard rule for production: endpoints MUST be user-configurable (comma-separated list, failover on errors).
+
+Implemented in this fork:
+- Solana RPC flags accept comma-separated lists (e.g. `--solana-rpc-url "rpc1,rpc2"`).
+- Swap bots + operator tools use `SolanaRpcPool` to fail over across RPC endpoints on errors.
+
+For real reliability, use your own RPC or a paid provider.
 
 
 ## Notes

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import process from 'node:process';
 
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import {
   createAssociatedTokenAccount,
   getAccount,
@@ -10,6 +10,7 @@ import {
 
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 import { readSolanaKeypair } from '../src/solana/keypair.js';
+import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { claimEscrowTx, refundEscrowTx, getEscrowState } from '../src/solana/lnUsdtEscrowClient.js';
 
 function die(msg) {
@@ -24,8 +25,8 @@ swaprecover (local-only recovery + receipts)
 Commands:
   list --receipts-db <path> [--limit <n>]
   show --receipts-db <path> (--trade-id <id> | --payment-hash <hex32>)
-  claim --receipts-db <path> (--trade-id <id> | --payment-hash <hex32>) --solana-rpc-url <url> --solana-keypair <path> [--commitment <confirmed|finalized|processed>]
-  refund --receipts-db <path> (--trade-id <id> | --payment-hash <hex32>) --solana-rpc-url <url> --solana-keypair <path> [--commitment <confirmed|finalized|processed>]
+  claim --receipts-db <path> (--trade-id <id> | --payment-hash <hex32>) --solana-rpc-url <url[,url2,...]> --solana-keypair <path> [--commitment <confirmed|finalized|processed>]
+  refund --receipts-db <path> (--trade-id <id> | --payment-hash <hex32>) --solana-rpc-url <url[,url2,...]> --solana-keypair <path> [--commitment <confirmed|finalized|processed>]
 
 Notes:
   - Receipts DB should live under onchain/ (gitignored).
@@ -76,9 +77,9 @@ async function ensureAta({ connection, payer, mint, owner }) {
   }
 }
 
-async function sendAndConfirm(connection, tx) {
+async function sendAndConfirm(connection, tx, commitment = 'confirmed') {
   const sig = await connection.sendRawTransaction(tx.serialize());
-  const conf = await connection.confirmTransaction(sig, 'confirmed');
+  const conf = await connection.confirmTransaction(sig, commitment);
   if (conf?.value?.err) {
     throw new Error(`Tx failed: ${JSON.stringify(conf.value.err)}`);
   }
@@ -147,31 +148,39 @@ async function main() {
       const commitment = flags.get('commitment') ? String(flags.get('commitment')).trim() : 'confirmed';
 
       const recipient = readSolanaKeypair(keyPath);
-      const connection = new Connection(rpcUrl, commitment);
+      const pool = new SolanaRpcPool({ rpcUrls: rpcUrl, commitment });
 
-      const onchain = await getEscrowState(connection, hash, programId, commitment);
+      const onchain = await pool.call((connection) => getEscrowState(connection, hash, programId, commitment), { label: 'escrow-get' });
       if (!onchain) die('Escrow not found on chain.');
       if (Number(onchain.status) !== 0) {
         die(`Escrow not active (status=${onchain.status}). Refusing to claim.`);
       }
 
-      const recipientToken = await ensureAta({
-        connection,
-        payer: recipient,
-        mint,
-        owner: recipient.publicKey,
-      });
+      const recipientToken = await pool.call(
+        (connection) =>
+          ensureAta({
+            connection,
+            payer: recipient,
+            mint,
+            owner: recipient.publicKey,
+          }),
+        { label: 'ensure-recipient-ata' }
+      );
 
-      const { tx } = await claimEscrowTx({
-        connection,
-        recipient,
-        recipientTokenAccount: recipientToken,
-        mint,
-        paymentHashHex: hash,
-        preimageHex: preimage,
-        programId,
-      });
-      const sig = await sendAndConfirm(connection, tx);
+      const { tx } = await pool.call(
+        (connection) =>
+          claimEscrowTx({
+            connection,
+            recipient,
+            recipientTokenAccount: recipientToken,
+            mint,
+            paymentHashHex: hash,
+            preimageHex: preimage,
+            programId,
+          }),
+        { label: 'claim:build-tx' }
+      );
+      const sig = await pool.call((connection) => sendAndConfirm(connection, tx, commitment), { label: 'claim:send' });
 
       store.upsertTrade(trade.trade_id, { state: 'claimed' });
       store.appendEvent(trade.trade_id, 'recovery_claim', { tx_sig: sig, payment_hash_hex: hash });
@@ -204,30 +213,38 @@ async function main() {
         die(`Refund keypair pubkey mismatch (got=${refund.publicKey.toBase58()} want=${refundAddr.toBase58()})`);
       }
 
-      const connection = new Connection(rpcUrl, commitment);
+      const pool = new SolanaRpcPool({ rpcUrls: rpcUrl, commitment });
 
-      const onchain = await getEscrowState(connection, hash, programId, commitment);
+      const onchain = await pool.call((connection) => getEscrowState(connection, hash, programId, commitment), { label: 'escrow-get' });
       if (!onchain) die('Escrow not found on chain.');
       if (Number(onchain.status) !== 0) {
         die(`Escrow not active (status=${onchain.status}). Refusing to refund.`);
       }
 
-      const refundToken = await ensureAta({
-        connection,
-        payer: refund,
-        mint,
-        owner: refund.publicKey,
-      });
+      const refundToken = await pool.call(
+        (connection) =>
+          ensureAta({
+            connection,
+            payer: refund,
+            mint,
+            owner: refund.publicKey,
+          }),
+        { label: 'ensure-refund-ata' }
+      );
 
-      const { tx } = await refundEscrowTx({
-        connection,
-        refund,
-        refundTokenAccount: refundToken,
-        mint,
-        paymentHashHex: hash,
-        programId,
-      });
-      const sig = await sendAndConfirm(connection, tx);
+      const { tx } = await pool.call(
+        (connection) =>
+          refundEscrowTx({
+            connection,
+            refund,
+            refundTokenAccount: refundToken,
+            mint,
+            paymentHashHex: hash,
+            programId,
+          }),
+        { label: 'refund:build-tx' }
+      );
+      const sig = await pool.call((connection) => sendAndConfirm(connection, tx, commitment), { label: 'refund:send' });
 
       store.upsertTrade(trade.trade_id, { state: 'refunded' });
       store.appendEvent(trade.trade_id, 'recovery_refund', { tx_sig: sig, payment_hash_hex: hash });

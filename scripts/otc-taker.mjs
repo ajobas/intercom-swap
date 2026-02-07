@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -26,6 +26,7 @@ import { verifySwapPrePayOnchain } from '../src/swap/verify.js';
 import { normalizeClnNetwork } from '../src/ln/cln.js';
 import { claimEscrowTx } from '../src/solana/lnUsdtEscrowClient.js';
 import { readSolanaKeypair } from '../src/solana/keypair.js';
+import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import { openTradeReceiptsStore } from '../src/receipts/store.js';
 
 const execFileP = promisify(execFile);
@@ -272,8 +273,8 @@ async function main() {
   const sol = runSwap
     ? (() => {
         const payer = readSolanaKeypair(solKeypairPath);
-        const connection = new Connection(solRpcUrl, 'confirmed');
-        return { payer, connection };
+        const pool = new SolanaRpcPool({ rpcUrls: solRpcUrl, commitment: 'confirmed' });
+        return { payer, pool };
       })()
     : null;
 
@@ -550,13 +551,17 @@ async function main() {
     }
 
     // Hard rule: verify escrow on-chain before paying.
-    const prepay = await verifySwapPrePayOnchain({
-      terms: swapCtx.trade.terms,
-      invoiceBody: swapCtx.trade.invoice,
-      escrowBody: swapCtx.trade.escrow,
-      connection: sol.connection,
-      now_unix: Math.floor(Date.now() / 1000),
-    });
+    const prepay = await sol.pool.call(
+      (connection) =>
+        verifySwapPrePayOnchain({
+          terms: swapCtx.trade.terms,
+          invoiceBody: swapCtx.trade.invoice,
+          escrowBody: swapCtx.trade.escrow,
+          connection,
+          now_unix: Math.floor(Date.now() / 1000),
+        }),
+      { label: 'taker:verify-prepay' }
+    );
     if (!prepay.ok) throw new Error(`verify-prepay failed: ${prepay.error}`);
 
     if (priceGuard) {
@@ -632,23 +637,31 @@ async function main() {
 
     // Claim escrow on Solana.
     const mint = new PublicKey(swapCtx.trade.terms.sol_mint);
-    const recipientToken = await ensureAta({
-      connection: sol.connection,
-      payer: sol.payer,
-      mint,
-      owner: sol.payer.publicKey,
-    });
+    const recipientToken = await sol.pool.call(
+      (connection) =>
+        ensureAta({
+          connection,
+          payer: sol.payer,
+          mint,
+          owner: sol.payer.publicKey,
+        }),
+      { label: 'taker:ensure-ata' }
+    );
     const programId = swapCtx.trade.escrow?.program_id ? new PublicKey(swapCtx.trade.escrow.program_id) : undefined;
-    const { tx: claimTx } = await claimEscrowTx({
-      connection: sol.connection,
-      recipient: sol.payer,
-      recipientTokenAccount: recipientToken,
-      mint,
-      paymentHashHex,
-      preimageHex,
-      ...(programId ? { programId } : {}),
-    });
-    const claimSig = await sendAndConfirm(sol.connection, claimTx);
+    const { tx: claimTx } = await sol.pool.call(
+      (connection) =>
+        claimEscrowTx({
+          connection,
+          recipient: sol.payer,
+          recipientTokenAccount: recipientToken,
+          mint,
+          paymentHashHex,
+          preimageHex,
+          ...(programId ? { programId } : {}),
+        }),
+      { label: 'taker:build-claim-tx' }
+    );
+    const claimSig = await sol.pool.call((connection) => sendAndConfirm(connection, claimTx), { label: 'taker:send-claim-tx' });
 
     const solClaimedUnsigned = createUnsignedEnvelope({
       v: 1,

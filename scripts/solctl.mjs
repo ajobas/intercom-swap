@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
+import { Keypair, PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 import {
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -21,6 +21,7 @@ import {
   readSolanaKeypair,
   writeSolanaKeypair,
 } from '../src/solana/keypair.js';
+import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 
 function die(msg) {
   process.stderr.write(`${msg}\n`);
@@ -32,7 +33,7 @@ function usage() {
 solctl (Solana wallet + inventory operator tool; local keypairs only)
 
 Global flags:
-  --rpc-url <url>                    (default: http://127.0.0.1:8899)
+  --rpc-url <url[,url2,...]>         (default: http://127.0.0.1:8899)
   --commitment <processed|confirmed|finalized> (default: confirmed)
 
 Commands:
@@ -162,6 +163,19 @@ async function main() {
 
   const rpcUrl = (flags.get('rpc-url') && String(flags.get('rpc-url')).trim()) || 'http://127.0.0.1:8899';
   const commitment = (flags.get('commitment') && String(flags.get('commitment')).trim()) || 'confirmed';
+  const pool = new SolanaRpcPool({ rpcUrls: rpcUrl, commitment });
+
+  // Pick a working endpoint once per invocation to avoid accidentally re-running
+  // non-idempotent operations (mint creation, transfers) across multiple RPCs.
+  let cachedConnection = null;
+  async function getConnection() {
+    if (cachedConnection) return cachedConnection;
+    cachedConnection = await pool.call(async (connection) => {
+      await connection.getLatestBlockhash(commitment);
+      return connection;
+    }, { label: 'solctl:rpc-pick' });
+    return cachedConnection;
+  }
 
   if (cmd === 'keygen') {
     const out = requireFlag(flags, 'out');
@@ -183,7 +197,7 @@ async function main() {
   if (cmd === 'balance') {
     const keypairPath = requireFlag(flags, 'keypair');
     const kp = readSolanaKeypair(keypairPath);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
     const lamports = await connection.getBalance(kp.publicKey, commitment);
     process.stdout.write(`${JSON.stringify({ type: 'balance', pubkey: kp.publicKey.toBase58(), lamports, sol: lamports / 1e9 }, null, 2)}\n`);
     return;
@@ -193,7 +207,7 @@ async function main() {
     const keypairPath = requireFlag(flags, 'keypair');
     const sol = parseSol(requireFlag(flags, 'sol'), 'sol');
     const kp = readSolanaKeypair(keypairPath);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
     const sig = await connection.requestAirdrop(kp.publicKey, Math.round(sol * 1e9));
     await connection.confirmTransaction(sig, commitment);
     process.stdout.write(`${JSON.stringify({ type: 'airdrop', pubkey: kp.publicKey.toBase58(), sol, tx_sig: sig }, null, 2)}\n`);
@@ -205,7 +219,7 @@ async function main() {
     const to = toPubkey(requireFlag(flags, 'to'), 'to');
     const sol = parseSol(requireFlag(flags, 'sol'), 'sol');
     const payer = readSolanaKeypair(keypairPath);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
 
     const ix = SystemProgram.transfer({
       fromPubkey: payer.publicKey,
@@ -228,7 +242,7 @@ async function main() {
     if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) die('Invalid --decimals (0..18)');
     const out = flags.get('out') ? String(flags.get('out')).trim() : '';
     const payer = readSolanaKeypair(keypairPath);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
 
     // Mint keypair is generated locally and can optionally be written out.
     const mintKp = Keypair.generate();
@@ -247,7 +261,7 @@ async function main() {
 
   if (cmd === 'mint-info') {
     const mint = toPubkey(requireFlag(flags, 'mint'), 'mint');
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
     const info = await getMint(connection, mint, commitment);
     process.stdout.write(`${JSON.stringify({
       type: 'mint_info',
@@ -266,7 +280,7 @@ async function main() {
     const payer = readSolanaKeypair(keypairPath);
     const owner = flags.get('owner') ? toPubkey(String(flags.get('owner')).trim(), 'owner') : payer.publicKey;
     const create = parseBool(flags.get('create'), true);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
 
     const ata = await getAssociatedTokenAddress(mint, owner, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
     let exists = true;
@@ -289,7 +303,7 @@ async function main() {
     const mint = toPubkey(requireFlag(flags, 'mint'), 'mint');
     const payer = readSolanaKeypair(keypairPath);
     const owner = flags.get('owner') ? toPubkey(String(flags.get('owner')).trim(), 'owner') : payer.publicKey;
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
     const ata = await getAssociatedTokenAddress(mint, owner, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
     let amount = 0n;
     let exists = true;
@@ -310,7 +324,7 @@ async function main() {
     const amount = parseU64(requireFlag(flags, 'amount'), 'amount');
     const createAta = parseBool(flags.get('create-ata'), true);
     const payer = readSolanaKeypair(keypairPath);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
 
     const fromAta = await getAssociatedTokenAddress(mint, payer.publicKey, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
     const toAta = await getAssociatedTokenAddress(mint, to, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
@@ -329,7 +343,7 @@ async function main() {
     const amount = parseU64(requireFlag(flags, 'amount'), 'amount');
     const createAta = parseBool(flags.get('create-ata'), true);
     const payer = readSolanaKeypair(keypairPath);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
 
     const toAta = await getAssociatedTokenAddress(mint, to, false, TOKEN_PROGRAM_ID, ASSOCIATED_TOKEN_PROGRAM_ID);
     if (createAta) {
@@ -347,7 +361,7 @@ async function main() {
       ? mintsRaw.split(',').map((s) => s.trim()).filter(Boolean).map((s) => toPubkey(s, 'mint'))
       : [];
     const payer = readSolanaKeypair(keypairPath);
-    const connection = new Connection(rpcUrl, commitment);
+    const connection = await getConnection();
     const lamports = await connection.getBalance(payer.publicKey, commitment);
 
     const tokenBalances = [];
@@ -377,4 +391,3 @@ async function main() {
 }
 
 main().catch((err) => die(err?.stack || err?.message || String(err)));
-

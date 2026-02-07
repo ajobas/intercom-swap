@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import process from 'node:process';
 
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import {
   createAssociatedTokenAccount,
   getAccount,
@@ -9,6 +9,7 @@ import {
 } from '@solana/spl-token';
 
 import { readSolanaKeypair } from '../src/solana/keypair.js';
+import { SolanaRpcPool } from '../src/solana/rpcPool.js';
 import {
   LN_USDT_ESCROW_PROGRAM_ID,
   deriveConfigPda,
@@ -30,7 +31,7 @@ function usage() {
 escrowctl (Solana LN<->SPL escrow program operator tool)
 
 Global flags:
-  --solana-rpc-url <url>              (default: http://127.0.0.1:8899)
+  --solana-rpc-url <url[,url2,...]>   (default: http://127.0.0.1:8899)
   --commitment <processed|confirmed|finalized> (default: confirmed)
   --program-id <base58>               (default: LN_USDT_ESCROW_PROGRAM_ID)
 
@@ -123,11 +124,11 @@ async function main() {
   const commitment = (flags.get('commitment') && String(flags.get('commitment')).trim()) || 'confirmed';
   const programIdStr = (flags.get('program-id') && String(flags.get('program-id')).trim()) || '';
   const programId = programIdStr ? new PublicKey(programIdStr) : LN_USDT_ESCROW_PROGRAM_ID;
-  const connection = new Connection(rpcUrl, commitment);
+  const pool = new SolanaRpcPool({ rpcUrls: rpcUrl, commitment });
 
   if (cmd === 'config-get') {
     const { pda: configPda } = deriveConfigPda(programId);
-    const state = await getConfigState(connection, programId, commitment);
+    const state = await pool.call((connection) => getConfigState(connection, programId, commitment), { label: 'config-get' });
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -153,7 +154,7 @@ async function main() {
 
   if (cmd === 'escrow-get') {
     const paymentHashHex = requireFlag(flags, 'payment-hash').trim().toLowerCase();
-    const state = await getEscrowState(connection, paymentHashHex, programId, commitment);
+    const state = await pool.call((connection) => getEscrowState(connection, paymentHashHex, programId, commitment), { label: 'escrow-get' });
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -192,7 +193,7 @@ async function main() {
     const feeVaultAta = await deriveFeeVaultAta(configPda, mint);
     let amount = 0n;
     try {
-      const acct = await getAccount(connection, feeVaultAta, commitment);
+      const acct = await pool.call((connection) => getAccount(connection, feeVaultAta, commitment), { label: 'fees-balance' });
       amount = acct.amount;
     } catch (_e) {
       amount = 0n;
@@ -229,16 +230,20 @@ async function main() {
     }
 
     const build = cmd === 'config-init' ? initConfigTx : setConfigTx;
-    const { tx, configPda } = await build({
-      connection,
-      ...(cmd === 'config-init' ? { payer: signer } : { authority: signer }),
-      feeCollector,
-      feeBps,
-      programId,
-    });
+    const { tx, configPda } = await pool.call(
+      (connection) =>
+        build({
+          connection,
+          ...(cmd === 'config-init' ? { payer: signer } : { authority: signer }),
+          feeCollector,
+          feeBps,
+          programId,
+        }),
+      { label: cmd }
+    );
 
     if (simulate) {
-      const sim = await connection.simulateTransaction(tx, { commitment });
+      const sim = await pool.call((connection) => connection.simulateTransaction(tx, { commitment }), { label: `${cmd}:simulate` });
       process.stdout.write(
         `${JSON.stringify(
           {
@@ -255,7 +260,7 @@ async function main() {
       return;
     }
 
-    const sig = await sendAndConfirm(connection, tx, commitment);
+    const sig = await pool.call((connection) => sendAndConfirm(connection, tx, commitment), { label: cmd });
     process.stdout.write(
       `${JSON.stringify(
         {
@@ -282,24 +287,30 @@ async function main() {
 
     const destAta = await getAssociatedTokenAddress(mint, signer.publicKey, false);
     if (createAta) {
-      try {
-        await getAccount(connection, destAta, commitment);
-      } catch (_e) {
-        await createAssociatedTokenAccount(connection, signer, mint, signer.publicKey);
-      }
+      await pool.call(async (connection) => {
+        try {
+          await getAccount(connection, destAta, commitment);
+        } catch (_e) {
+          await createAssociatedTokenAccount(connection, signer, mint, signer.publicKey);
+        }
+      }, { label: 'ensure-dest-ata' });
     }
 
-    const { tx, feeVaultAta, configPda } = await withdrawFeesTx({
-      connection,
-      feeCollector: signer,
-      feeCollectorTokenAccount: destAta,
-      mint,
-      amount,
-      programId,
-    });
+    const { tx, feeVaultAta, configPda } = await pool.call(
+      (connection) =>
+        withdrawFeesTx({
+          connection,
+          feeCollector: signer,
+          feeCollectorTokenAccount: destAta,
+          mint,
+          amount,
+          programId,
+        }),
+      { label: 'fees-withdraw:build' }
+    );
 
     if (simulate) {
-      const sim = await connection.simulateTransaction(tx, { commitment });
+      const sim = await pool.call((connection) => connection.simulateTransaction(tx, { commitment }), { label: 'fees-withdraw:simulate' });
       process.stdout.write(
         `${JSON.stringify(
           {
@@ -319,7 +330,7 @@ async function main() {
       return;
     }
 
-    const sig = await sendAndConfirm(connection, tx, commitment);
+    const sig = await pool.call((connection) => sendAndConfirm(connection, tx, commitment), { label: 'fees-withdraw' });
     process.stdout.write(
       `${JSON.stringify(
         {
