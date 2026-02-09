@@ -1286,7 +1286,16 @@ function App() {
                     onQuote={() => {
                       setRunMode('tool');
                       setToolName('intercomswap_quote_post_from_rfq');
-                      setToolArgsBoth({ channel: e.channel, rfq_envelope: e.message, valid_for_sec: 60 });
+                      setToolArgsBoth({
+                        channel: e.channel,
+                        rfq_envelope: e.message,
+                        // Defaults (editable): 0.5% + 0.5% and 72h Solana refund window.
+                        platform_fee_bps: 50,
+                        trade_fee_bps: 50,
+                        trade_fee_collector: String(preflight?.sol_signer?.pubkey || '...'),
+                        sol_refund_window_sec: 72 * 3600,
+                        valid_for_sec: 60,
+                      });
                       setPromptOpen(true);
                     }}
                   />
@@ -1304,6 +1313,12 @@ function App() {
                     trade_id: `rfq-${Date.now()}`,
                     btc_sats: 10000,
                     usdt_amount: '1000000',
+                    // Defaults (editable): accept up to protocol caps; prefer a long Solana refund window.
+                    max_platform_fee_bps: 500,
+                    max_trade_fee_bps: 1000,
+                    max_total_fee_bps: 1500,
+                    min_sol_refund_window_sec: 72 * 3600,
+                    max_sol_refund_window_sec: 7 * 24 * 3600,
                     valid_until_unix: Math.floor(Date.now() / 1000) + 600,
                   });
                   setPromptOpen(true);
@@ -2209,6 +2224,19 @@ function satsToBtcDisplay(sats: number) {
   return atomicToDecimal(String(Math.trunc(sats)), 8);
 }
 
+function bpsToPctDisplay(bps: number) {
+  if (!Number.isFinite(bps)) return '';
+  return (bps / 100).toFixed(2).replace(/\.00$/, '');
+}
+
+function secToHuman(sec: number) {
+  if (!Number.isFinite(sec) || sec < 0) return '';
+  if (sec % 86400 === 0) return `${sec / 86400}d`;
+  if (sec % 3600 === 0) return `${sec / 3600}h`;
+  if (sec % 60 === 0) return `${sec / 60}m`;
+  return `${sec}s`;
+}
+
 function parseLines(text: string) {
   return String(text || '')
     .split('\n')
@@ -2292,6 +2320,8 @@ function ToolForm({
         const isBtcSats = k === 'btc_sats' || k === 'amount_sats';
         const isMsat = k === 'amount_msat';
         const isUsdt = k === 'usdt_amount';
+        const isBps = sch?.type === 'integer' && (k.endsWith('_bps') || k.includes('bps'));
+        const isSec = sch?.type === 'integer' && (k.endsWith('_sec') || k.includes('_sec'));
         const isAtomicDigits = sch?.type === 'string' && typeof sch?.pattern === 'string' && sch.pattern === '^[0-9]+$';
         const isGenericAtomic = isAtomicDigits && (k === 'amount' || k === 'lamports');
         const enumVals = Array.isArray(sch?.enum) ? sch.enum : null;
@@ -2323,6 +2353,18 @@ function ToolForm({
                 name={`msat-${tool.name}-${k}`}
                 msat={typeof v === 'number' ? v : null}
                 onMsat={(next) => (next === null ? del(k) : update(k, next))}
+              />
+            ) : isBps ? (
+              <BpsField
+                name={`bps-${tool.name}-${k}`}
+                bps={typeof v === 'number' ? v : null}
+                onBps={(next) => (next === null ? del(k) : update(k, next))}
+              />
+            ) : isSec ? (
+              <DurationSecField
+                name={`sec-${tool.name}-${k}`}
+                sec={typeof v === 'number' ? v : null}
+                onSec={(next) => (next === null ? del(k) : update(k, next))}
               />
             ) : isGenericAtomic ? (
               <AtomicDisplayField
@@ -2596,6 +2638,161 @@ function BtcSatsField({ name, sats, onSats }: { name: string; sats: number | nul
   );
 }
 
+function BpsField({ name, bps, onBps }: { name: string; bps: number | null; onBps: (next: number | null) => void }) {
+  const [unit, setUnit] = useState<'bps' | '%'>('%');
+  const [display, setDisplay] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (bps === null || bps === undefined) return;
+    if (unit === 'bps') setDisplay(String(bps));
+    else setDisplay(bpsToPctDisplay(bps));
+  }, [bps, unit]);
+
+  return (
+    <div className="amt">
+      <div className="row">
+        <label className="seg">
+          <input type="radio" name={name} checked={unit === '%'} onChange={() => setUnit('%')} />
+          <span>%</span>
+        </label>
+        <label className="seg">
+          <input type="radio" name={name} checked={unit === 'bps'} onChange={() => setUnit('bps')} />
+          <span>bps</span>
+        </label>
+      </div>
+      <input
+        className="input mono"
+        type="text"
+        value={display}
+        placeholder={unit === '%' ? '0.50' : '50'}
+        onChange={(e) => {
+          const raw = e.target.value.trim();
+          setDisplay(raw);
+          if (!raw) {
+            setErr(null);
+            onBps(null);
+            return;
+          }
+          if (unit === 'bps') {
+            if (!/^[0-9]+$/.test(raw)) {
+              setErr('digits only');
+              return;
+            }
+            const n = Number.parseInt(raw, 10);
+            if (!Number.isFinite(n) || !Number.isSafeInteger(n)) {
+              setErr('invalid bps');
+              return;
+            }
+            setErr(null);
+            onBps(n);
+            return;
+          }
+          // Percent can be decimal.
+          if (!/^[0-9]+(\.[0-9]+)?$/.test(raw)) {
+            setErr('invalid %');
+            return;
+          }
+          const pct = Number.parseFloat(raw);
+          if (!Number.isFinite(pct)) {
+            setErr('invalid %');
+            return;
+          }
+          const out = Math.round(pct * 100);
+          if (!Number.isSafeInteger(out) || out < 0) {
+            setErr('invalid %');
+            return;
+          }
+          setErr(null);
+          onBps(out);
+        }}
+      />
+      {typeof bps === 'number' ? (
+        <div className="muted small">
+          bps: <span className="mono">{bps}</span> ({bpsToPctDisplay(bps)}%)
+        </div>
+      ) : null}
+      {err ? <div className="alert bad">{err}</div> : null}
+    </div>
+  );
+}
+
+function DurationSecField({ name, sec, onSec }: { name: string; sec: number | null; onSec: (next: number | null) => void }) {
+  const [unit, setUnit] = useState<'sec' | 'min' | 'hour' | 'day'>('hour');
+  const [display, setDisplay] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (sec === null || sec === undefined) return;
+    const s = Math.trunc(sec);
+    if (unit === 'day') setDisplay(String(Math.trunc(s / 86400)));
+    else if (unit === 'hour') setDisplay(String(Math.trunc(s / 3600)));
+    else if (unit === 'min') setDisplay(String(Math.trunc(s / 60)));
+    else setDisplay(String(s));
+  }, [sec, unit]);
+
+  return (
+    <div className="amt">
+      <div className="row">
+        <label className="seg">
+          <input type="radio" name={name} checked={unit === 'hour'} onChange={() => setUnit('hour')} />
+          <span>hours</span>
+        </label>
+        <label className="seg">
+          <input type="radio" name={name} checked={unit === 'day'} onChange={() => setUnit('day')} />
+          <span>days</span>
+        </label>
+        <label className="seg">
+          <input type="radio" name={name} checked={unit === 'min'} onChange={() => setUnit('min')} />
+          <span>min</span>
+        </label>
+        <label className="seg">
+          <input type="radio" name={name} checked={unit === 'sec'} onChange={() => setUnit('sec')} />
+          <span>sec</span>
+        </label>
+      </div>
+      <input
+        className="input mono"
+        type="text"
+        value={display}
+        placeholder={unit === 'hour' ? '72' : unit === 'day' ? '3' : unit === 'min' ? '60' : '3600'}
+        onChange={(e) => {
+          const raw = e.target.value.trim();
+          setDisplay(raw);
+          if (!raw) {
+            setErr(null);
+            onSec(null);
+            return;
+          }
+          if (!/^[0-9]+$/.test(raw)) {
+            setErr('digits only');
+            return;
+          }
+          const n = Number.parseInt(raw, 10);
+          if (!Number.isFinite(n) || !Number.isSafeInteger(n) || n < 0) {
+            setErr('invalid number');
+            return;
+          }
+          const factor = unit === 'day' ? 86400 : unit === 'hour' ? 3600 : unit === 'min' ? 60 : 1;
+          const out = n * factor;
+          if (!Number.isSafeInteger(out)) {
+            setErr('too large');
+            return;
+          }
+          setErr(null);
+          onSec(out);
+        }}
+      />
+      {typeof sec === 'number' ? (
+        <div className="muted small">
+          sec: <span className="mono">{Math.trunc(sec)}</span> ({secToHuman(Math.trunc(sec))})
+        </div>
+      ) : null}
+      {err ? <div className="alert bad">{err}</div> : null}
+    </div>
+  );
+}
+
 function MsatField({ name, msat, onMsat }: { name: string; msat: number | null; onMsat: (next: number | null) => void }) {
   const [unit, setUnit] = useState<'msat' | 'sats'>('sats');
   const [display, setDisplay] = useState('');
@@ -2704,10 +2901,14 @@ function RfqRow({ evt, onSelect, onQuote }: { evt: any; onSelect: () => void; on
           USDT: {usdtAtomic ? `${atomicToDecimal(usdtAtomic, 6)} (${usdtAtomic})` : '?'}
         </span>
         <span className="mono">
-          fee caps (bps): {maxPlatform ?? '?'} platform, {maxTrade ?? '?'} trade, {maxTotal ?? '?'} total
+          fee caps:{' '}
+          {typeof maxPlatform === 'number' ? `${maxPlatform} bps (${bpsToPctDisplay(maxPlatform)}%)` : '?'} platform,{' '}
+          {typeof maxTrade === 'number' ? `${maxTrade} bps (${bpsToPctDisplay(maxTrade)}%)` : '?'} trade,{' '}
+          {typeof maxTotal === 'number' ? `${maxTotal} bps (${bpsToPctDisplay(maxTotal)}%)` : '?'} total
         </span>
         <span className="mono">
-          sol window: {minWin ?? '?'}-{maxWin ?? '?'} sec
+          sol window: {typeof minWin === 'number' ? `${secToHuman(minWin)} (${minWin}s)` : '?'}-
+          {typeof maxWin === 'number' ? `${secToHuman(maxWin)} (${maxWin}s)` : '?'}
         </span>
         <span className="mono">
           valid_until: {validUntil ?? '?'}
