@@ -175,6 +175,93 @@ test('prompt router: seals secrets in tool results and allows secret handles to 
   assert.equal(out.content, 'ok');
 });
 
+test('prompt router: repairs flattened offer_post args into offers[] (LLM tool-call compatibility)', async () => {
+  let calls = 0;
+  const llmClient = {
+    chatCompletions: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          raw: null,
+          message: { role: 'assistant', content: null },
+          content: '',
+          toolCalls: [
+            {
+              id: 'call_1',
+              name: 'intercomswap_offer_post',
+              // Common mistake: model flattens offer fields at root.
+              arguments: {
+                channels: ['0000intercomswapbtcusdt'],
+                name: 'maker:alice',
+                pair: 'BTC_LN/USDT_SOL',
+                have: 'USDT_SOL',
+                want: 'BTC_LN',
+                btc_sats: 10000,
+                usdt_amount: '1000000',
+                max_platform_fee_bps: 50,
+                max_trade_fee_bps: 50,
+                max_total_fee_bps: 100,
+                min_sol_refund_window_sec: 3600,
+                max_sol_refund_window_sec: 7200,
+              },
+              argumentsRaw: '{}',
+              parseError: null,
+            },
+          ],
+          finishReason: 'tool_calls',
+          usage: null,
+        };
+      }
+      return {
+        raw: null,
+        message: { role: 'assistant', content: 'ok' },
+        content: 'ok',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: null,
+      };
+    },
+  };
+
+  const toolExecutor = {
+    execute: async (name, args) => {
+      assert.equal(name, 'intercomswap_offer_post');
+      assert.ok(args && typeof args === 'object');
+      assert.ok(Array.isArray(args.offers), 'expected offers[] after repair');
+      assert.equal(args.have, undefined);
+      assert.equal(args.want, undefined);
+      assert.equal(args.pair, undefined);
+      assert.deepEqual(args.offers[0].have, 'USDT_SOL');
+      assert.deepEqual(args.offers[0].want, 'BTC_LN');
+      return { type: 'offer_posted', ok: true };
+    },
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-prompt-'));
+  const router = new PromptRouter({
+    llmConfig: {
+      baseUrl: 'http://stub/',
+      apiKey: '',
+      model: 'stub',
+      maxTokens: 0,
+      temperature: null,
+      topP: null,
+      topK: null,
+      minP: null,
+      repetitionPenalty: null,
+      toolFormat: 'tools',
+      timeoutMs: 1000,
+    },
+    llmClient,
+    toolExecutor,
+    auditDir: tmpDir,
+    maxSteps: 4,
+  });
+
+  const out = await router.run({ prompt: 'post offer', autoApprove: true });
+  assert.equal(out.content, 'ok');
+});
+
 test('audit log: redacts sensitive keys', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-audit-'));
   const log = new AuditLog({ dir: tmpDir, sessionId: 'sess1' });

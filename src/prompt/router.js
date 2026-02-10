@@ -36,6 +36,45 @@ function isObject(v) {
   return v && typeof v === 'object' && !Array.isArray(v);
 }
 
+function repairToolArguments(toolName, args) {
+  // Best-effort repair for common model mistakes. Keep this tightly scoped and conservative.
+  if (!isObject(args)) return args;
+
+  // Models often flatten offer fields (have/want/btc_sats/...) at the top-level for offer_post.
+  // The schema requires these to live under offers[].
+  if (toolName === 'intercomswap_offer_post') {
+    const out = { ...args };
+    if (!Array.isArray(out.offers)) {
+      const offerKeys = [
+        'pair',
+        'have',
+        'want',
+        'btc_sats',
+        'usdt_amount',
+        'max_platform_fee_bps',
+        'max_trade_fee_bps',
+        'max_total_fee_bps',
+        'min_sol_refund_window_sec',
+        'max_sol_refund_window_sec',
+      ];
+      const hasFlattened = offerKeys.some((k) => k in out);
+      if (hasFlattened) {
+        const o = {};
+        for (const k of offerKeys) {
+          if (k in out) {
+            o[k] = out[k];
+            delete out[k];
+          }
+        }
+        out.offers = [o];
+      }
+    }
+    return out;
+  }
+
+  return args;
+}
+
 function safeJsonParse(text) {
   const raw = String(text ?? '').trim();
   if (!raw) return { ok: false, value: null, error: 'empty' };
@@ -386,14 +425,15 @@ export class PromptRouter {
       const name = isTool && typeof obj.name === 'string' ? obj.name.trim() : '';
       const args = isTool && isObject(obj.arguments) ? obj.arguments : null;
       if (isTool && name && allowedToolNames.has(name) && args) {
+        const repairedArgs = repairToolArguments(name, args);
         audit.write('direct_tool_prompt', { sessionId: id, name, arguments: args, autoApprove, dryRun });
         const toolStartedAt = nowMs();
-        const toolResult = await this.toolExecutor.execute(name, args, { autoApprove, dryRun, secrets: session.secrets });
+        const toolResult = await this.toolExecutor.execute(name, repairedArgs, { autoApprove, dryRun, secrets: session.secrets });
         const toolResultForModel = sealToolResultForModel(toolResult, session.secrets);
         const toolStep = {
           type: 'tool',
           name,
-          arguments: args,
+          arguments: repairedArgs,
           started_at: toolStartedAt,
           duration_ms: nowMs() - toolStartedAt,
           result: toolResultForModel,
@@ -556,18 +596,19 @@ export class PromptRouter {
           }
 
           const toolStartedAt = nowMs();
-          audit.write('tool_call', { name: call.name, arguments: call.arguments, dryRun, autoApprove });
-          const toolResult = await this.toolExecutor.execute(call.name, call.arguments, {
+          const repairedArgs = repairToolArguments(call.name, call.arguments);
+          audit.write('tool_call', { name: call.name, arguments: repairedArgs, dryRun, autoApprove });
+          const toolResult = await this.toolExecutor.execute(call.name, repairedArgs, {
             autoApprove,
             dryRun,
             secrets: session.secrets,
           });
           const toolResultForModel = sealToolResultForModel(toolResult, session.secrets);
-          lastExecutedTool = { name: call.name, arguments: call.arguments, result: toolResultForModel };
+          lastExecutedTool = { name: call.name, arguments: repairedArgs, result: toolResultForModel };
           const toolStep = {
             type: 'tool',
             name: call.name,
-            arguments: call.arguments,
+            arguments: repairedArgs,
             started_at: toolStartedAt,
             duration_ms: nowMs() - toolStartedAt,
             result: toolResultForModel,
