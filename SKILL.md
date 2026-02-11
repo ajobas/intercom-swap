@@ -448,6 +448,7 @@ A→Z operating flow:
    - `intercomswap_sc_info` (confirm peer pubkey and joined channels)
 2. Start stack (or peer-only if already running)
    - Preferred: `intercomswap_stack_start` with explicit `peer_name`, `peer_store`, `sc_port`, `sidechannels`, and bootstrap flags for your environment.
+   - Keep `sidechannels` as rendezvous-only channels. Never include invite-only `swap:*` trade channels in this list.
    - `intercomswap_stack_start` auto-starts backend trade automation by default. Verify with `intercomswap_tradeauto_status`.
      - default backend automation profile includes:
        - `ln_liquidity_mode=aggregate`

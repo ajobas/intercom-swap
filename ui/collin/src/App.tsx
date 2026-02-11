@@ -212,6 +212,32 @@ function deriveScEventDedupKey(evt: any): string {
   return `evt:${channel}:${kind}:${tradeId}:${ts}`;
 }
 
+function isSwapTradeChannelName(raw: any): boolean {
+  const ch = String(raw || '').trim().toLowerCase();
+  return ch.startsWith('swap:');
+}
+
+function normalizeChannels(
+  input: any,
+  opts: { max?: number; dropSwapTradeChannels?: boolean } = {}
+): string[] {
+  const max = Number.isFinite(opts?.max as any) && Number(opts.max) > 0 ? Math.max(1, Math.trunc(Number(opts.max))) : 50;
+  const dropSwapTradeChannels = opts?.dropSwapTradeChannels !== false;
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const list = Array.isArray(input) ? input : [];
+  for (const cRaw of list) {
+    const c = String(cRaw || '').trim();
+    if (!c) continue;
+    if (dropSwapTradeChannels && isSwapTradeChannelName(c)) continue;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    out.push(c);
+    if (out.length >= max) break;
+  }
+  return out;
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<
     | 'overview'
@@ -260,6 +286,7 @@ function App() {
   const [scConnecting, setScConnecting] = useState(false);
   const [scStreamErr, setScStreamErr] = useState<string | null>(null);
   const [scChannels, setScChannels] = useState<string>('0000intercomswapbtcusdt');
+  const [scSwapWatchChannels, setScSwapWatchChannelsState] = useState<string[]>([]);
   const [scFilter, setScFilter] = useState<{ channel: string; kind: string }>({ channel: '', kind: '' });
   const [showExpiredInvites, setShowExpiredInvites] = useState<boolean>(() => {
     try {
@@ -1156,11 +1183,19 @@ function App() {
     return out;
   }, [scEvents, terminalReceiptTradeIdsSet]);
 
+  const rendezvousChannels = useMemo(
+    () => normalizeChannels(scChannels.split(',').map((s) => s.trim()).filter(Boolean), { max: 50, dropSwapTradeChannels: true }),
+    [scChannels]
+  );
+
+  const rendezvousChannelsSet = useMemo(() => new Set(rendezvousChannels), [rendezvousChannels]);
+
   const watchedChannelsSet = useMemo(() => {
     const set = new Set<string>();
-    for (const c of scChannels.split(',').map((s) => s.trim()).filter(Boolean)) set.add(c);
+    for (const c of rendezvousChannels) set.add(c);
+    for (const c of scSwapWatchChannels) set.add(c);
     return set;
-  }, [scChannels]);
+  }, [rendezvousChannels, scSwapWatchChannels]);
 
  const inviteEvents = useMemo(() => {
     const now = uiNowMs;
@@ -1199,7 +1234,8 @@ function App() {
       const c = String((e as any)?.channel || '').trim();
       if (c) set.add(c);
     }
-    for (const c of scChannels.split(',').map((s) => s.trim()).filter(Boolean)) set.add(c);
+    for (const c of rendezvousChannels) set.add(c);
+    for (const c of scSwapWatchChannels) set.add(c);
     try {
       const joined = Array.isArray(preflight?.sc_stats?.channels) ? (preflight.sc_stats.channels as any[]) : [];
       for (const c of joined) {
@@ -1208,7 +1244,7 @@ function App() {
       }
     } catch (_e) {}
     return Array.from(set).sort();
-  }, [scEvents, scChannels, preflight?.sc_stats]);
+  }, [scEvents, rendezvousChannels, scSwapWatchChannels, preflight?.sc_stats]);
   const knownChannelsForInputs = useMemo(() => knownChannels.slice(0, 500), [knownChannels]);
 
   const lnWalletLocked = useMemo(() => {
@@ -1285,25 +1321,39 @@ function App() {
     });
   }
 
-  function setWatchedChannels(next: string[]) {
-    const uniq: string[] = [];
-    const seen = new Set<string>();
-    for (const c of next.map((s) => String(s || '').trim()).filter(Boolean)) {
-      if (seen.has(c)) continue;
-      seen.add(c);
-      uniq.push(c);
-      if (uniq.length >= 50) break;
-    }
+  function setRendezvousChannels(next: string[]) {
+    const uniq = normalizeChannels(next.map((s) => String(s || '').trim()).filter(Boolean), { max: 50, dropSwapTradeChannels: true });
     setScChannels(uniq.join(','));
+  }
+
+  function setRendezvousChannelsFromInput(raw: string) {
+    const uniq = normalizeChannels(
+      String(raw || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+      { max: 50, dropSwapTradeChannels: true }
+    );
+    setScChannels(uniq.join(','));
+  }
+
+  function setSwapWatchChannels(next: string[]) {
+    const uniq = normalizeChannels(next.map((s) => String(s || '').trim()).filter(Boolean), { max: 50, dropSwapTradeChannels: false }).filter((c) =>
+      isSwapTradeChannelName(c)
+    );
+    setScSwapWatchChannelsState(uniq);
   }
 
   function watchChannel(channelRaw: string) {
     const channel = String(channelRaw || '').trim();
     if (!channel) return;
-    if (watchedChannelsSet.has(channel)) return;
-    const curr = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
-    curr.push(channel);
-    setWatchedChannels(curr);
+    if (isSwapTradeChannelName(channel)) {
+      if (scSwapWatchChannels.includes(channel)) return;
+      setSwapWatchChannels([...scSwapWatchChannels, channel]);
+    } else {
+      if (rendezvousChannelsSet.has(channel)) return;
+      setRendezvousChannels([...rendezvousChannels, channel]);
+    }
     // Restart the stream quickly so the new channel appears without requiring a manual reconnect.
     setTimeout(() => void startScStream(), 150);
   }
@@ -1311,9 +1361,11 @@ function App() {
   function unwatchChannel(channelRaw: string) {
     const channel = String(channelRaw || '').trim();
     if (!channel) return;
-    const curr = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
-    const next = curr.filter((c) => c !== channel);
-    setWatchedChannels(next);
+    if (isSwapTradeChannelName(channel)) {
+      setSwapWatchChannels(scSwapWatchChannels.filter((c) => c !== channel));
+    } else {
+      setRendezvousChannels(rendezvousChannels.filter((c) => c !== channel));
+    }
     setTimeout(() => void startScStream(), 150);
   }
 
@@ -1330,11 +1382,10 @@ function App() {
       missing.push(ch);
     }
     if (missing.length < 1) return;
-    const curr = scChannels.split(',').map((s) => s.trim()).filter(Boolean);
-    setWatchedChannels([...curr, ...missing]);
+    setSwapWatchChannels([...scSwapWatchChannels, ...missing]);
     setTimeout(() => void startScStream(), 150);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [health?.ok, joinedChannels, watchedChannelsSet, scChannels]);
+  }, [health?.ok, joinedChannels, watchedChannelsSet, scSwapWatchChannels]);
 
   async function acceptQuoteEnvelope(quoteEvt: any, opts: { origin: 'manual' }) {
     const channel = String((quoteEvt as any)?.channel || '').trim();
@@ -1823,17 +1874,13 @@ function App() {
     return out;
   }
 
-	  async function stackStart() {
+  async function stackStart() {
 	    if (stackOpBusy) return;
 	    setStackOpBusy(true);
 	    setRunErr(null);
 	    try {
 	      pushToast('info', 'Starting stack (peer + LN + Solana). This can take ~1-2 minutes...', { ttlMs: 9000 });
-	      const sidechannels = scChannels
-	        .split(',')
-	        .map((s) => s.trim())
-	        .filter(Boolean)
-	        .slice(0, 50);
+	      const sidechannels = rendezvousChannels.slice(0, 50);
 
       setRunMode('tool');
       setToolName('intercomswap_stack_start');
@@ -1914,11 +1961,7 @@ function App() {
     setRunBusy(true);
     setRunErr(null);
     try {
-      const channels = scChannels
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .slice(0, 64);
+      const channels = rendezvousChannels.slice(0, 64);
       await runToolFinal('intercomswap_tradeauto_start', {
         channels: channels.length > 0 ? channels : ['0000intercomswapbtcusdt'],
         trace_enabled: tradeAutoTraceEnabled,
@@ -2282,7 +2325,7 @@ function App() {
         ? body.rfq_channels.map((c: any) => String(c || '').trim()).filter(Boolean)
         : [];
       const channel =
-        rfqChans[0] || String(offerEvt?.channel || '').trim() || scChannels.split(',')[0]?.trim() || '0000intercomswapbtcusdt';
+        rfqChans[0] || String(offerEvt?.channel || '').trim() || rendezvousChannels[0] || '0000intercomswapbtcusdt';
 
       // Adopt all offer lines (max 20). Each RFQ line has its own trade_id so multiple can run in parallel.
       const adoptedLines: RfqLine[] = [];
@@ -2402,11 +2445,7 @@ function App() {
       return void pushToast('error', 'Expiry must be in the future');
     }
 
-	    const channels = scChannels
-	      .split(',')
-	      .map((s) => s.trim())
-	      .filter(Boolean)
-	      .slice(0, 20);
+	    const channels = rendezvousChannels.slice(0, 20);
 	    if (channels.length < 1) return void pushToast('error', 'No rendezvous channels configured');
 
 	    const autoName =
@@ -2496,7 +2535,7 @@ function App() {
     const SOL_REFUND_MIN_SEC = 3600; // 1h
     const SOL_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
 
-    const channel = rfqChannel.trim() || scChannels.split(',')[0]?.trim() || '';
+    const channel = rfqChannel.trim() || rendezvousChannels[0] || '';
     if (!channel) return void pushToast('error', 'RFQ channel is required');
     const solRecipient = String(solSignerPubkey || '').trim();
     if (!solRecipient) return void pushToast('error', 'Solana signer pubkey unavailable (cannot set RFQ sol_recipient)');
@@ -3395,11 +3434,7 @@ function App() {
 			const ac = new AbortController();
 			scAbortRef.current = ac;
 
-			const channels = scChannels
-				.split(',')
-				.map((s) => s.trim())
-				.filter(Boolean)
-	      .slice(0, 50);
+			const channels = Array.from(watchedChannelsSet).slice(0, 50);
 	    const url = new URL('/v1/sc/stream', window.location.origin);
 	    if (channels.length > 0) url.searchParams.set('channels', channels.join(','));
 	    url.searchParams.set('backlog', '250');
@@ -3781,7 +3816,7 @@ function App() {
     if (scConnected || scConnecting) return;
     void startScStream();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [health?.ok, preflight?.peer_status, scChannels, envInfo?.sc_bridge?.url]);
+  }, [health?.ok, preflight?.peer_status, scChannels, scSwapWatchChannels, envInfo?.sc_bridge?.url]);
 
   // Lazy load tab-specific data.
   useEffect(() => {
@@ -3824,6 +3859,7 @@ function App() {
     // Reset in-memory logs when switching env kinds so operators don't get "mixed" UI.
     setScEvents([]);
     scEventDedupRef.current.clear();
+    setScSwapWatchChannelsState([]);
     setPromptEvents([]);
     setPromptChat([]);
 
@@ -4204,7 +4240,7 @@ function App() {
                 <input
                   className="input mono"
                   value={scChannels}
-                  onChange={(e) => setScChannels(e.target.value)}
+                  onChange={(e) => setRendezvousChannelsFromInput(e.target.value)}
                   placeholder="0000intercomswapbtcusdt"
                 />
               </div>
@@ -4300,7 +4336,7 @@ function App() {
 	                <input
 	                  className="input"
 	                  value={scChannels}
-	                  onChange={(e) => setScChannels(e.target.value)}
+	                  onChange={(e) => setRendezvousChannelsFromInput(e.target.value)}
 	                  placeholder="channels (csv)"
 	                />
 	                <span className={`chip ${scConnected ? 'hi' : scConnecting ? 'warn' : ''}`}>
@@ -4608,7 +4644,7 @@ function App() {
                 <input
                   className="input mono"
                   value={scChannels}
-                  onChange={(e) => setScChannels(e.target.value)}
+                  onChange={(e) => setRendezvousChannelsFromInput(e.target.value)}
                   placeholder="0000intercomswapbtcusdt"
                 />
                 <div className="muted small">Offers are broadcast here. BTC sellers post matching RFQs into the same channels.</div>
@@ -4939,7 +4975,7 @@ function App() {
                               const chans = Array.isArray(a?.channels)
                                 ? a.channels.map((c: any) => String(c || '').trim()).filter(Boolean)
                                 : [];
-                              if (chans.length > 0) setScChannels(chans.join(','));
+                              if (chans.length > 0) setRendezvousChannels(chans);
                               if (typeof a?.name === 'string') setOfferName(a.name);
                               const offers = Array.isArray(a?.offers) ? a.offers : [];
                               const lines = offers
@@ -5050,7 +5086,7 @@ function App() {
                       </option>
                     ))
                   ) : (
-                    <option value={scChannels.split(',')[0]?.trim() || '0000intercomswapbtcusdt'}>default</option>
+                    <option value={rendezvousChannels[0] || '0000intercomswapbtcusdt'}>default</option>
                   )}
                 </select>
               </div>

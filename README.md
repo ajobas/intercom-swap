@@ -789,6 +789,9 @@ Current Collin wallet/trading guardrails:
 - Autopost bots stop automatically on insufficient-funds/liquidity errors (and stop on expiry/fill as before).
 - Trade automation now runs server-side (backend worker via `intercomswap_tradeauto_*`), not in browser state. Collin no longer owns client-side settlement loops.
 - Collin sidechannel stream processing deduplicates repeated SC events (including reconnect backlog duplicates) before inserting into the local event store to keep browser CPU/load bounded.
+- Collin keeps invite-only `swap:*` trade channels separate from rendezvous settings:
+  - trade channels can be auto-watched for stream visibility after join/invite,
+  - but they are never promoted into the global rendezvous channel configuration used for stack start or Offer/RFQ broadcast.
 - If backend trace shows `stopped`, start/stop it directly in Collin Overview (`Trade Automation Trace`) or call `intercomswap_tradeauto_start` / `intercomswap_tradeauto_stop`.
 
 Examples:
