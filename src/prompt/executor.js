@@ -440,6 +440,13 @@ function toPositiveIntOrNull(value) {
   return Math.trunc(n);
 }
 
+function toNonNegativeIntOrNull(value) {
+  if (value === null || value === undefined) return null;
+  const n = typeof value === 'number' ? value : Number.parseInt(String(value).trim(), 10);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.trunc(n);
+}
+
 function isExpiredUnixSec(validUntilUnix, { nowSec = null } = {}) {
   const vu = toPositiveIntOrNull(validUntilUnix);
   if (!vu) return false;
@@ -452,6 +459,123 @@ function toEpochMsOrZero(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return n > 1e12 ? Math.trunc(n) : Math.trunc(n * 1000);
+}
+
+function buildRfqListingLock(rfqId) {
+  const id = normalizeHex32(rfqId, 'rfq_id');
+  return {
+    listingKey: `rfq:${id}`,
+    listingType: 'rfq',
+    listingId: id,
+  };
+}
+
+function buildOfferLineListingLock({
+  offerId,
+  offerLineIndex,
+  offerIdLabel = 'offer_id',
+  offerLineIndexLabel = 'offer_line_index',
+} = {}) {
+  const id = normalizeHex32(offerId, offerIdLabel);
+  const idx = toNonNegativeIntOrNull(offerLineIndex);
+  if (idx === null) throw new Error(`${offerLineIndexLabel} must be a non-negative integer`);
+  return {
+    listingKey: `offer_line:${id}:${idx}`,
+    listingType: 'offer_line',
+    listingId: `${id}:${idx}`,
+    offerId: id,
+    offerLineIndex: idx,
+  };
+}
+
+function extractOfferLineListingLockFromQuote(quoteEnvelope, { toolName = 'tool' } = {}) {
+  const body = isObject(quoteEnvelope?.body) ? quoteEnvelope.body : {};
+  const rawOfferId = body.offer_id;
+  const rawOfferLineIndex = body.offer_line_index;
+  const hasOfferId = rawOfferId !== undefined && rawOfferId !== null && String(rawOfferId).trim().length > 0;
+  const hasOfferLineIndex =
+    rawOfferLineIndex !== undefined && rawOfferLineIndex !== null && String(rawOfferLineIndex).trim().length > 0;
+  if (!hasOfferId && !hasOfferLineIndex) return null;
+  if (!hasOfferId || !hasOfferLineIndex) {
+    throw new Error(`${toolName}: quote.offer_id and quote.offer_line_index must both be set`);
+  }
+  return buildOfferLineListingLock({
+    offerId: String(rawOfferId),
+    offerLineIndex: rawOfferLineIndex,
+    offerIdLabel: `${toolName}: quote.offer_id`,
+    offerLineIndexLabel: `${toolName}: quote.offer_line_index`,
+  });
+}
+
+function ensureListingLockAvailable({
+  store,
+  listing,
+  tradeId = '',
+  toolName = 'tool',
+  allowSameTradeInFlight = false,
+} = {}) {
+  if (!store || !listing) return null;
+  const lock = store.getListingLock(listing.listingKey);
+  if (!lock) return null;
+  const state = String(lock.state || '').trim().toLowerCase();
+  const lockTradeId = String(lock.trade_id || '').trim();
+  if (state === 'filled') {
+    throw new Error(`${toolName}: listing_filled (${listing.listingType}:${listing.listingId})`);
+  }
+  if (state === 'in_flight') {
+    if (allowSameTradeInFlight && tradeId && lockTradeId && lockTradeId === tradeId) {
+      return lock;
+    }
+    throw new Error(
+      `${toolName}: listing_in_progress (${listing.listingType}:${listing.listingId}${
+        lockTradeId ? `, trade_id=${lockTradeId}` : ''
+      })`
+    );
+  }
+  throw new Error(`${toolName}: listing_lock_invalid_state (${listing.listingType}:${listing.listingId}, state=${state || 'unknown'})`);
+}
+
+function upsertListingLockInFlight({ store, listing, tradeId, note = '', meta = null } = {}) {
+  if (!store || !listing) return null;
+  return store.upsertListingLock(listing.listingKey, {
+    listing_type: listing.listingType,
+    listing_id: listing.listingId,
+    trade_id: String(tradeId || '').trim() || null,
+    state: 'in_flight',
+    note: note || null,
+    meta_json: meta ?? null,
+  });
+}
+
+function markListingLocksFilledByTrade(store, tradeId, { note = 'filled' } = {}) {
+  if (!store) return 0;
+  const id = String(tradeId || '').trim();
+  if (!id) return 0;
+  const rows = store.listListingLocksByTrade(id, { limit: 2000 });
+  for (const row of rows) {
+    const listingKey = String(row?.listing_key || '').trim();
+    const listingType = String(row?.listing_type || '').trim();
+    const listingId = String(row?.listing_id || '').trim();
+    if (!listingKey || !listingType || !listingId) continue;
+    store.upsertListingLock(listingKey, {
+      listing_type: listingType,
+      listing_id: listingId,
+      trade_id: id,
+      state: 'filled',
+      note: note || null,
+      meta_json: row?.meta_json ?? null,
+    });
+  }
+  return rows.length;
+}
+
+function releaseListingLocksByTrade(store, tradeId) {
+  if (!store) return 0;
+  const id = String(tradeId || '').trim();
+  if (!id) return 0;
+  const rows = store.listListingLocksByTrade(id, { limit: 2000 });
+  store.deleteListingLocksByTrade(id);
+  return rows.length;
 }
 
 function extractLnConnectedPeerIds(listPeers) {
@@ -3277,6 +3401,25 @@ export class ToolExecutor {
           }`
         );
       }
+      {
+        const store = await this._openReceiptsStore({ required: false });
+        try {
+          if (store) {
+            const rfqListing = buildRfqListingLock(rfqId);
+            ensureListingLockAvailable({
+              store,
+              listing: rfqListing,
+              tradeId,
+              toolName,
+              allowSameTradeInFlight: false,
+            });
+          }
+        } finally {
+          try {
+            store?.close?.();
+          } catch (_e) {}
+        }
+      }
 
       // Fees are not negotiated per-trade: they are read from on-chain config/trade-config.
       const programId = this._programId();
@@ -3346,6 +3489,8 @@ export class ToolExecutor {
       assertAllowedKeys(args, toolName, [
         'channel',
         'rfq_envelope',
+        'offer_envelope',
+        'offer_line_index',
         'trade_fee_collector',
         'sol_refund_window_sec',
         'valid_until_unix',
@@ -3372,6 +3517,51 @@ export class ToolExecutor {
       const solRefundWindowSec =
         expectOptionalInt(args, toolName, 'sol_refund_window_sec', { min: SOL_REFUND_MIN_SEC, max: SOL_REFUND_MAX_SEC }) ??
         SOL_REFUND_DEFAULT_SEC;
+      const offerArgProvided = args.offer_envelope !== undefined && args.offer_envelope !== null;
+      const offerLineArgProvided = args.offer_line_index !== undefined && args.offer_line_index !== null;
+      let offerEnvelope = null;
+      let offerLineListing = null;
+      if (offerArgProvided || offerLineArgProvided) {
+        if (!offerArgProvided || !offerLineArgProvided) {
+          throw new Error(`${toolName}: offer_envelope and offer_line_index must be provided together`);
+        }
+        offerEnvelope = resolveSecretArg(secrets, args.offer_envelope, { label: 'offer_envelope', expectType: 'object' });
+        if (!isObject(offerEnvelope)) throw new Error(`${toolName}: offer_envelope must be an object`);
+        const ov = validateSwapEnvelope(offerEnvelope);
+        if (!ov.ok) throw new Error(`${toolName}: invalid offer_envelope: ${ov.error}`);
+        if (offerEnvelope.kind !== KIND.SVC_ANNOUNCE) {
+          throw new Error(`${toolName}: offer_envelope.kind must be ${KIND.SVC_ANNOUNCE}`);
+        }
+        const osigOk = verifySignedEnvelope(offerEnvelope);
+        if (!osigOk.ok) throw new Error(`${toolName}: offer_envelope signature invalid: ${osigOk.error}`);
+        const offerValidUntil = toPositiveIntOrNull(offerEnvelope?.body?.valid_until_unix);
+        const nowSec = Math.floor(Date.now() / 1000);
+        if (offerValidUntil && isExpiredUnixSec(offerValidUntil, { nowSec })) {
+          throw new Error(`${toolName}: offer_envelope is expired`);
+        }
+        const offerId = hashUnsignedEnvelope(stripSignature(offerEnvelope));
+        offerLineListing = buildOfferLineListingLock({
+          offerId,
+          offerLineIndex: args.offer_line_index,
+          offerIdLabel: 'offer_envelope.id',
+          offerLineIndexLabel: 'offer_line_index',
+        });
+        const offerLines = Array.isArray(offerEnvelope?.body?.offers) ? offerEnvelope.body.offers : [];
+        if (offerLineListing.offerLineIndex >= offerLines.length) {
+          throw new Error(`${toolName}: offer_line_index out of range for offer_envelope.offers`);
+        }
+        const offerLineRaw = offerLines[offerLineListing.offerLineIndex];
+        const offerLine = isObject(offerLineRaw) ? offerLineRaw : null;
+        if (!offerLine) throw new Error(`${toolName}: offer_envelope.offers[offer_line_index] must be an object`);
+        const offerLineBtc = Number.parseInt(String(offerLine?.btc_sats || ''), 10);
+        const offerLineUsdt = String(offerLine?.usdt_amount || '').trim();
+        if (!Number.isFinite(offerLineBtc) || offerLineBtc < 1 || !/^[0-9]+$/.test(offerLineUsdt)) {
+          throw new Error(`${toolName}: offer_envelope.offers[offer_line_index] missing btc_sats/usdt_amount`);
+        }
+        if (offerLineBtc !== btcSats || offerLineUsdt !== usdtAmount) {
+          throw new Error(`${toolName}: offer_envelope.offers[offer_line_index] does not match RFQ btc_sats/usdt_amount`);
+        }
+      }
 
       const rfqMinWindowRaw = rfq?.body?.min_sol_refund_window_sec;
       const rfqMaxWindowRaw = rfq?.body?.max_sol_refund_window_sec;
@@ -3410,6 +3600,34 @@ export class ToolExecutor {
             listingState.swap_channel ? ` (swap_channel=${listingState.swap_channel})` : ''
           }`
         );
+      }
+      {
+        const store = await this._openReceiptsStore({ required: false });
+        try {
+          if (store) {
+            const rfqListing = buildRfqListingLock(rfqId);
+            ensureListingLockAvailable({
+              store,
+              listing: rfqListing,
+              tradeId,
+              toolName,
+              allowSameTradeInFlight: false,
+            });
+            if (offerLineListing) {
+              ensureListingLockAvailable({
+                store,
+                listing: offerLineListing,
+                tradeId,
+                toolName,
+                allowSameTradeInFlight: false,
+              });
+            }
+          }
+        } finally {
+          try {
+            store?.close?.();
+          } catch (_e) {}
+        }
       }
 
       // Fees are not negotiated per-trade: they are read from on-chain config/trade-config.
@@ -3484,6 +3702,12 @@ export class ToolExecutor {
           trade_fee_bps: tradeFeeBps,
           trade_fee_collector: tradeFeeCollector,
           sol_refund_window_sec: solRefundWindowSec,
+          ...(offerLineListing
+            ? {
+                offer_id: offerLineListing.offerId,
+                offer_line_index: offerLineListing.offerLineIndex,
+              }
+            : {}),
           ...(fees.platformFeeCollector ? { platform_fee_collector: String(fees.platformFeeCollector) } : {}),
           valid_until_unix: validUntil,
         },
@@ -3587,13 +3811,61 @@ export class ToolExecutor {
         },
       });
       if (dryRun) return { type: 'dry_run', tool: toolName, channel, unsigned };
+      const rfqListing = buildRfqListingLock(rfqId);
+      const store = await this._openReceiptsStore({ required: false });
+      let rfqLockCreated = false;
+      try {
+        if (store) {
+          const existing = ensureListingLockAvailable({
+            store,
+            listing: rfqListing,
+            tradeId,
+            toolName,
+            allowSameTradeInFlight: true,
+          });
+          const existingState = String(existing?.state || '').trim().toLowerCase();
+          const existingTradeId = String(existing?.trade_id || '').trim();
+          const sameTradeInFlight = existingState === 'in_flight' && existingTradeId === tradeId;
+          if (!sameTradeInFlight) {
+            upsertListingLockInFlight({
+              store,
+              listing: rfqListing,
+              tradeId,
+              note: 'quote_accept_posted',
+              meta: { quote_id: quoteId },
+            });
+            rfqLockCreated = true;
+          }
+        }
 
-      const signing = await this._requirePeerSigning();
-      return withScBridge(this.scBridge, async (sc) => {
-        const signed = signSwapEnvelope(unsigned, signing);
-        await this._sendEnvelopeLogged(sc, channel, signed);
-        return { type: 'quote_accept_posted', channel, envelope: signed, rfq_id: rfqId, quote_id: quoteId, ln_liquidity: liq };
-      });
+        const signing = await this._requirePeerSigning();
+        const result = await withScBridge(this.scBridge, async (sc) => {
+          const signed = signSwapEnvelope(unsigned, signing);
+          await this._sendEnvelopeLogged(sc, channel, signed);
+          return { type: 'quote_accept_posted', channel, envelope: signed, rfq_id: rfqId, quote_id: quoteId, ln_liquidity: liq };
+        });
+        if (store) {
+          upsertListingLockInFlight({
+            store,
+            listing: rfqListing,
+            tradeId,
+            note: 'quote_accept_posted',
+            meta: { quote_id: quoteId },
+          });
+        }
+        return result;
+      } catch (err) {
+        if (store && rfqLockCreated) {
+          try {
+            store.deleteListingLock(rfqListing.listingKey);
+          } catch (_e) {}
+        }
+        throw err;
+      } finally {
+        try {
+          store?.close?.();
+        } catch (_e) {}
+      }
     }
 
     if (toolName === 'intercomswap_swap_invite_from_accept') {
@@ -3670,6 +3942,25 @@ export class ToolExecutor {
       if (listingState.active) {
         throw new Error(`${toolName}: listing already in-flight (swap channel pending)`);
       }
+      const offerLineListing = extractOfferLineListingLockFromQuote(quoteEnv, { toolName });
+      {
+        const store = await this._openReceiptsStore({ required: false });
+        try {
+          if (store && offerLineListing) {
+            ensureListingLockAvailable({
+              store,
+              listing: offerLineListing,
+              tradeId,
+              toolName,
+              allowSameTradeInFlight: true,
+            });
+          }
+        } finally {
+          try {
+            store?.close?.();
+          } catch (_e) {}
+        }
+      }
 
       const counterpartyHint = isObject(accept?.body?.ln_liquidity_hint) ? accept.body.ln_liquidity_hint : null;
       let counterpartyLiquidityCheck = { status: 'missing' };
@@ -3708,66 +3999,127 @@ export class ToolExecutor {
           swap_channel: swapChannel,
           rfq_id: rfqId,
           quote_id: quoteId,
+          ...(offerLineListing
+            ? {
+                offer_id: offerLineListing.offerId,
+                offer_line_index: offerLineListing.offerLineIndex,
+              }
+            : {}),
           counterparty_liquidity_check: counterpartyLiquidityCheck,
         };
       }
 
-      const signing = await this._requirePeerSigning();
-      const ownerPubKey = signing.pubHex;
-      const issuedAt = Date.now();
-      const welcome = createSignedWelcome(
-        { channel: swapChannel, ownerPubKey, text: welcomeText, issuedAt, version: 1 },
-        (payload) => signPayloadHex(payload, signing.secHex)
-      );
-      const invite = createSignedInvite(
-        {
-          channel: swapChannel,
-          inviteePubKey,
-          inviterPubKey: ownerPubKey,
-          inviterAddress: null,
-          issuedAt,
-          ttlMs: (ttlSec !== null ? ttlSec : 7 * 24 * 3600) * 1000,
-          version: 1,
-        },
-        (payload) => signPayloadHex(payload, signing.secHex),
-        { welcome }
-      );
-      const unsigned = createUnsignedEnvelope({
-        v: 1,
-        kind: KIND.SWAP_INVITE,
-        tradeId,
-        body: {
-          rfq_id: rfqId,
-          quote_id: quoteId,
+      const store = await this._openReceiptsStore({ required: false });
+      let offerLockCreated = false;
+      let invitePosted = false;
+      try {
+        if (store && offerLineListing) {
+          const existing = ensureListingLockAvailable({
+            store,
+            listing: offerLineListing,
+            tradeId,
+            toolName,
+            allowSameTradeInFlight: true,
+          });
+          const existingState = String(existing?.state || '').trim().toLowerCase();
+          const existingTradeId = String(existing?.trade_id || '').trim();
+          const sameTradeInFlight = existingState === 'in_flight' && existingTradeId === tradeId;
+          if (!sameTradeInFlight) {
+            upsertListingLockInFlight({
+              store,
+              listing: offerLineListing,
+              tradeId,
+              note: 'swap_invite_posting',
+              meta: { rfq_id: rfqId, quote_id: quoteId },
+            });
+            offerLockCreated = true;
+          }
+        }
+
+        const signing = await this._requirePeerSigning();
+        const ownerPubKey = signing.pubHex;
+        const issuedAt = Date.now();
+        const welcome = createSignedWelcome(
+          { channel: swapChannel, ownerPubKey, text: welcomeText, issuedAt, version: 1 },
+          (payload) => signPayloadHex(payload, signing.secHex)
+        );
+        const invite = createSignedInvite(
+          {
+            channel: swapChannel,
+            inviteePubKey,
+            inviterPubKey: ownerPubKey,
+            inviterAddress: null,
+            issuedAt,
+            ttlMs: (ttlSec !== null ? ttlSec : 7 * 24 * 3600) * 1000,
+            version: 1,
+          },
+          (payload) => signPayloadHex(payload, signing.secHex),
+          { welcome }
+        );
+        const unsigned = createUnsignedEnvelope({
+          v: 1,
+          kind: KIND.SWAP_INVITE,
+          tradeId,
+          body: {
+            rfq_id: rfqId,
+            quote_id: quoteId,
+            swap_channel: swapChannel,
+            owner_pubkey: ownerPubKey,
+            invite,
+            welcome,
+          },
+        });
+        const signed = signSwapEnvelope(unsigned, signing);
+
+        const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
+        await this._sendEnvelopeLogged(sc, channel, signed);
+        invitePosted = true;
+
+        // Ensure the maker peer has joined and verified the dynamic welcome on the same persistent
+        // SC session used by backend automation.
+        const joinRes = await sc.join(swapChannel, { welcome });
+        if (joinRes?.type === 'error') throw new Error(joinRes.error || 'join failed');
+        this._scSubscribed.add(swapChannel);
+        await sc.subscribe([swapChannel]);
+        if (store && offerLineListing) {
+          upsertListingLockInFlight({
+            store,
+            listing: offerLineListing,
+            tradeId,
+            note: 'swap_invite_posted',
+            meta: { rfq_id: rfqId, quote_id: quoteId, swap_channel: swapChannel },
+          });
+        }
+
+        return {
+          type: 'swap_invite_posted',
+          channel,
           swap_channel: swapChannel,
           owner_pubkey: ownerPubKey,
+          envelope: signed,
           invite,
           welcome,
-        },
-      });
-      const signed = signSwapEnvelope(unsigned, signing);
-
-      const sc = await this._scEnsurePersistent({ timeoutMs: 10_000 });
-      await this._sendEnvelopeLogged(sc, channel, signed);
-
-      // Ensure the maker peer has joined and verified the dynamic welcome on the same persistent
-      // SC session used by backend automation.
-      const joinRes = await sc.join(swapChannel, { welcome });
-      if (joinRes?.type === 'error') throw new Error(joinRes.error || 'join failed');
-      this._scSubscribed.add(swapChannel);
-      await sc.subscribe([swapChannel]);
-
-      return {
-        type: 'swap_invite_posted',
-        channel,
-        swap_channel: swapChannel,
-        owner_pubkey: ownerPubKey,
-        envelope: signed,
-        invite,
-        welcome,
-        maker_join: joinRes,
-        counterparty_liquidity_check: counterpartyLiquidityCheck,
-      };
+          maker_join: joinRes,
+          ...(offerLineListing
+            ? {
+                offer_id: offerLineListing.offerId,
+                offer_line_index: offerLineListing.offerLineIndex,
+              }
+            : {}),
+          counterparty_liquidity_check: counterpartyLiquidityCheck,
+        };
+      } catch (err) {
+        if (store && offerLineListing && offerLockCreated && !invitePosted) {
+          try {
+            store.deleteListingLock(offerLineListing.listingKey);
+          } catch (_e) {}
+        }
+        throw err;
+      } finally {
+        try {
+          store?.close?.();
+        } catch (_e) {}
+      }
     }
 
     if (toolName === 'intercomswap_join_from_swap_invite') {
@@ -4333,6 +4685,7 @@ export class ToolExecutor {
         await this._sendEnvelopeLogged(sc, channel, signed);
 
         try {
+          let releasedLocks = 0;
           if (store) {
             store.upsertTrade(tradeId, {
               swap_channel: channel,
@@ -4340,10 +4693,18 @@ export class ToolExecutor {
               last_error: null,
             });
             store.appendEvent(tradeId, 'swap_cancel', { channel, reason: reason || null });
+            releasedLocks = releaseListingLocksByTrade(store, tradeId);
           }
-        } catch (_e) {}
-
-        return { type: 'cancel_posted', channel, trade_id: tradeId, envelope: signed };
+          return {
+            type: 'cancel_posted',
+            channel,
+            trade_id: tradeId,
+            envelope: signed,
+            listing_locks_released: releasedLocks,
+          };
+        } catch (_e) {
+          return { type: 'cancel_posted', channel, trade_id: tradeId, envelope: signed };
+        }
       } finally {
         try {
           store?.close?.();
@@ -6039,6 +6400,10 @@ export class ToolExecutor {
         escrow_pda: claimBuild.escrowPda.toBase58(),
         tx_sig: claimSig,
       });
+      let listingLocksFilled = 0;
+      try {
+        listingLocksFilled = markListingLocksFilledByTrade(store, tradeId, { note: 'sol_claimed' });
+      } catch (_e) {}
 
       const unsigned = createUnsignedEnvelope({
         v: 1,
@@ -6054,11 +6419,11 @@ export class ToolExecutor {
 		      const signing = await this._requirePeerSigning();
 		      const sc = await this._scEnsureChannelSubscribed(channel, { timeoutMs: 10_000 });
 		      const signed = signSwapEnvelope(unsigned, signing);
-		      await this._sendEnvelopeLogged(sc, channel, signed);
-		      store.appendEvent(tradeId, 'sol_claimed_posted', { channel, payment_hash_hex: paymentHashHex });
-		      const envHandle = secrets && typeof secrets.put === 'function'
-		        ? secrets.put(signed, { key: 'sol_claimed', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
-		        : null;
+	      await this._sendEnvelopeLogged(sc, channel, signed);
+	      store.appendEvent(tradeId, 'sol_claimed_posted', { channel, payment_hash_hex: paymentHashHex });
+	      const envHandle = secrets && typeof secrets.put === 'function'
+	        ? secrets.put(signed, { key: 'sol_claimed', channel, trade_id: tradeId, payment_hash_hex: paymentHashHex })
+	        : null;
 	        return {
           type: 'sol_claimed_posted',
           channel,
@@ -6068,6 +6433,7 @@ export class ToolExecutor {
           tx_sig: claimSig,
           envelope_handle: envHandle,
           envelope: envHandle ? null : signed,
+          listing_locks_filled: listingLocksFilled,
         };
       } finally {
         store.close();
@@ -6904,7 +7270,19 @@ export class ToolExecutor {
 
         store.upsertTrade(trade.trade_id, { state: 'claimed' });
         store.appendEvent(trade.trade_id, 'recovery_claim', { tx_sig: sig, payment_hash_hex: hash });
-        return { type: 'recovered_claimed', trade_id: trade.trade_id, payment_hash_hex: hash, tx_sig: sig, escrow_pda: build.escrowPda.toBase58(), vault_ata: build.vault.toBase58() };
+        let listingLocksFilled = 0;
+        try {
+          listingLocksFilled = markListingLocksFilledByTrade(store, trade.trade_id, { note: 'recovery_claim' });
+        } catch (_e) {}
+        return {
+          type: 'recovered_claimed',
+          trade_id: trade.trade_id,
+          payment_hash_hex: hash,
+          tx_sig: sig,
+          escrow_pda: build.escrowPda.toBase58(),
+          vault_ata: build.vault.toBase58(),
+          listing_locks_filled: listingLocksFilled,
+        };
       }
 
       if (toolName === 'intercomswap_swaprecover_refund') {
@@ -6956,7 +7334,19 @@ export class ToolExecutor {
 
         store.upsertTrade(trade.trade_id, { state: 'refunded' });
         store.appendEvent(trade.trade_id, 'recovery_refund', { tx_sig: sig, payment_hash_hex: hash });
-        return { type: 'recovered_refunded', trade_id: trade.trade_id, payment_hash_hex: hash, tx_sig: sig, escrow_pda: build.escrowPda.toBase58(), vault_ata: build.vault.toBase58() };
+        let listingLocksReleased = 0;
+        try {
+          listingLocksReleased = releaseListingLocksByTrade(store, trade.trade_id);
+        } catch (_e) {}
+        return {
+          type: 'recovered_refunded',
+          trade_id: trade.trade_id,
+          payment_hash_hex: hash,
+          tx_sig: sig,
+          escrow_pda: build.escrowPda.toBase58(),
+          vault_ata: build.vault.toBase58(),
+          listing_locks_released: listingLocksReleased,
+        };
       }
       } finally {
         try {

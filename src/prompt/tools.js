@@ -447,6 +447,18 @@ export const INTERCOMSWAP_TOOLS = [
             { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Secret handle to an RFQ envelope.' },
           ],
         },
+        offer_envelope: {
+          anyOf: [
+            { type: 'object', description: 'Optional signed Offer (swap.svc_announce) envelope used for deterministic offer-line locking.' },
+            { type: 'string', pattern: '^secret:[0-9a-fA-F-]{10,}$', description: 'Optional secret handle to an Offer envelope.' },
+          ],
+        },
+        offer_line_index: {
+          type: 'integer',
+          minimum: 0,
+          maximum: 1000000,
+          description: 'Optional offer line index (requires offer_envelope). Used to lock exactly one offer line.',
+        },
         trade_fee_collector: { ...base58Param, description: 'Fee receiver pubkey. trade_fee_bps is read from the trade-config PDA for this address.' },
         sol_refund_window_sec: { type: 'integer', minimum: 3600, maximum: 7 * 24 * 3600, description: 'Solana refund/claim window (seconds) that will be used in binding TERMS.' },
         valid_until_unix: unixSecParam,

@@ -175,6 +175,13 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
     const msg = offerEvt?.message;
     const body = msg?.body && typeof msg.body === 'object' ? msg.body : null;
     if (!body) continue;
+    let offerId = '';
+    try {
+      offerId = String(hashUnsignedEnvelope(stripSignature(msg)) || '').trim().toLowerCase();
+    } catch (_e) {
+      offerId = '';
+    }
+    if (!/^[0-9a-f]{64}$/i.test(offerId)) continue;
 
     const validUntil = toIntOrNull(body.valid_until_unix);
     if (validUntil !== null && validUntil <= nowSec) continue;
@@ -185,7 +192,8 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
     if (rfqChannels.length > 0 && rfqChannel && !rfqChannels.includes(rfqChannel)) continue;
 
     const offers = Array.isArray(body.offers) ? body.offers : [];
-    for (const lineRaw of offers) {
+    for (let lineIndex = 0; lineIndex < offers.length; lineIndex += 1) {
+      const lineRaw = offers[lineIndex];
       const line = isObject(lineRaw) ? lineRaw : null;
       if (!line) continue;
       const lineBtc = toIntOrNull(line.btc_sats);
@@ -207,7 +215,12 @@ function matchOfferForRfq({ rfqEvt, myOfferEvents }) {
       let solRefundWindowSec = 72 * 3600;
       if (solRefundWindowSec < overlapMin) solRefundWindowSec = overlapMin;
       if (solRefundWindowSec > overlapMax) solRefundWindowSec = overlapMax;
-      return { solRefundWindowSec };
+      return {
+        solRefundWindowSec,
+        offerId,
+        offerLineIndex: lineIndex,
+        offerEnvelope: msg,
+      };
     }
   }
   return null;
@@ -1463,6 +1476,12 @@ export class TradeAutoManager {
               args: {
                 channel: ch,
                 rfq_envelope: rfqEvt.message,
+                ...(match && isObject(match.offerEnvelope)
+                  ? {
+                      offer_envelope: match.offerEnvelope,
+                      offer_line_index: Number(match.offerLineIndex),
+                    }
+                  : {}),
                 trade_fee_collector: localSolSigner,
                 sol_refund_window_sec: refundWindowSec,
                 valid_for_sec: 180,
