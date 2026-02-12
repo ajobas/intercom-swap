@@ -24,6 +24,9 @@ const MAINNET_USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 const SOL_TX_FEE_BUFFER_LAMPORTS = 50_000; // best-effort guardrail for claim/refund/transfer tx fees
 const LN_ROUTE_FEE_BUFFER_MIN_SATS = 50;
 const LN_ROUTE_FEE_BUFFER_BPS = 10; // 0.10%
+const LN_OPEN_TX_FEE_BUFFER_MIN_SATS = 1_000;
+const LN_OPEN_TX_WEIGHT_BUFFER_VB = 600; // conservative wallet funding tx estimate for channel open
+const LND_NEW_ANCHOR_RESERVE_SATS = 10_000;
 const MS_PER_HOUR = 60 * 60 * 1000;
 const SWAP_WATCH_RETENTION_MS = 2 * MS_PER_HOUR;
 
@@ -3224,12 +3227,27 @@ function App() {
       }
 
       let walletSats: number | null = null;
+      let walletConfirmedSats: number | null = null;
+      let walletUnconfirmedSats: number | null = null;
+      let walletLockedSats: number | null = null;
+      let walletReservedAnchorSats: number | null = null;
       if (impl === 'lnd') {
         const w = (listfunds as any).wallet;
         const confirmed = w && typeof w === 'object' ? Number.parseInt(String((w as any).confirmed_balance || '0'), 10) : 0;
         const unconfirmed = w && typeof w === 'object' ? Number.parseInt(String((w as any).unconfirmed_balance || '0'), 10) : 0;
-        const total = Number.isFinite(confirmed + unconfirmed) ? confirmed + unconfirmed : null;
-        walletSats = Number.isFinite(total as any) ? (total as any) : null;
+        const locked = w && typeof w === 'object' ? Number.parseInt(String((w as any).locked_balance || '0'), 10) : 0;
+        const reservedAnchor =
+          w && typeof w === 'object' ? Number.parseInt(String((w as any).reserved_balance_anchor_chan || '0'), 10) : 0;
+        const conf = Number.isFinite(confirmed) ? Math.max(0, Math.trunc(confirmed)) : 0;
+        const unconf = Number.isFinite(unconfirmed) ? Math.max(0, Math.trunc(unconfirmed)) : 0;
+        const lock = Number.isFinite(locked) ? Math.max(0, Math.trunc(locked)) : 0;
+        const reserve = Number.isFinite(reservedAnchor) ? Math.max(0, Math.trunc(reservedAnchor)) : 0;
+        const spendable = Math.max(0, conf - lock - reserve);
+        walletSats = spendable;
+        walletConfirmedSats = conf;
+        walletUnconfirmedSats = unconf;
+        walletLockedSats = lock;
+        walletReservedAnchorSats = reserve;
       } else {
         const outputs = Array.isArray((listfunds as any).outputs) ? (listfunds as any).outputs : [];
         let walletMsat = 0n;
@@ -3238,6 +3256,10 @@ function App() {
           if (msat !== null) walletMsat += msat;
         }
         walletSats = toSafe(walletMsat / 1000n);
+        walletConfirmedSats = walletSats;
+        walletUnconfirmedSats = null;
+        walletLockedSats = 0;
+        walletReservedAnchorSats = 0;
       }
 
       let totalOutbound = 0n;
@@ -3261,6 +3283,10 @@ function App() {
         channels: rows.length,
         channels_active: activeCount,
         wallet_sats: walletSats,
+        wallet_confirmed_sats: walletConfirmedSats,
+        wallet_unconfirmed_sats: walletUnconfirmedSats,
+        wallet_locked_sats: walletLockedSats,
+        wallet_reserved_anchor_sats: walletReservedAnchorSats,
         channel_rows: rows,
         max_outbound_sats: toSafe(maxOutbound),
         total_outbound_sats: toSafe(totalOutbound),
@@ -4382,6 +4408,14 @@ function App() {
   const lnMaxInboundSats = typeof preflight?.ln_summary?.max_inbound_sats === 'number' ? preflight.ln_summary.max_inbound_sats : null;
   const lnTotalInboundSats = typeof preflight?.ln_summary?.total_inbound_sats === 'number' ? preflight.ln_summary.total_inbound_sats : null;
 	  const lnWalletSats = typeof (preflight as any)?.ln_summary?.wallet_sats === 'number' ? (preflight as any).ln_summary.wallet_sats : null;
+  const lnWalletConfirmedSats =
+    typeof (preflight as any)?.ln_summary?.wallet_confirmed_sats === 'number'
+      ? (preflight as any).ln_summary.wallet_confirmed_sats
+      : null;
+  const lnWalletReservedAnchorSats =
+    typeof (preflight as any)?.ln_summary?.wallet_reserved_anchor_sats === 'number'
+      ? (preflight as any).ln_summary.wallet_reserved_anchor_sats
+      : null;
   const solLamportsAvailable =
     typeof (preflight as any)?.sol_balance === 'number'
       ? Number((preflight as any).sol_balance)
@@ -6728,15 +6762,31 @@ function App() {
                   </div>
                 </div>
 
-                {lnWalletSats !== null &&
-                Number.isInteger(lnChannelAmountSats) &&
-                lnChannelAmountSats > 0 &&
-                lnWalletSats < lnChannelAmountSats ? (
-                  <div className="alert warn" style={{ marginTop: 10, whiteSpace: 'pre-wrap' }}>
-                    <b>BTC funding required.</b> Wallet has {satsToBtcDisplay(lnWalletSats)} BTC ({lnWalletSats} sats) but opening{' '}
-                    {satsToBtcDisplay(lnChannelAmountSats)} BTC ({lnChannelAmountSats} sats) needs at least that amount plus fees.
-                  </div>
-                ) : null}
+                {(() => {
+                  if (lnWalletSats === null) return null;
+                  if (!Number.isInteger(lnChannelAmountSats) || lnChannelAmountSats <= 0) return null;
+                  const feeBuffer = Math.max(
+                    LN_OPEN_TX_FEE_BUFFER_MIN_SATS,
+                    Math.trunc(Math.max(1, Number(lnChannelSatPerVbyte || 0)) * LN_OPEN_TX_WEIGHT_BUFFER_VB)
+                  );
+                  const anchorReserve = lnImpl === 'lnd' ? LND_NEW_ANCHOR_RESERVE_SATS : 0;
+                  const needMin = lnChannelAmountSats + feeBuffer + anchorReserve;
+                  if (lnWalletSats >= needMin) return null;
+                  return (
+                    <div className="alert warn" style={{ marginTop: 10, whiteSpace: 'pre-wrap' }}>
+                      <b>BTC funding required.</b> Spendable wallet has {satsToBtcDisplay(lnWalletSats)} BTC ({lnWalletSats} sats), but opening{' '}
+                      {satsToBtcDisplay(lnChannelAmountSats)} BTC ({lnChannelAmountSats} sats) needs about {needMin} sats
+                      {' '}= amount {lnChannelAmountSats}
+                      {' '}+ fee buffer {feeBuffer}
+                      {anchorReserve > 0 ? ` + anchor reserve ${anchorReserve}` : ''}.
+                      {lnImpl === 'lnd' ? (
+                        <span>
+                          {' '}LND confirmed: {lnWalletConfirmedSats ?? '—'} sats, reserved anchor: {lnWalletReservedAnchorSats ?? '—'} sats.
+                        </span>
+                      ) : null}
+                    </div>
+                  );
+                })()}
 
                 <div className="gridform" style={{ marginTop: 8 }}>
                   <div className="field">
@@ -6799,6 +6849,23 @@ function App() {
                       const node_id = String(m[1]).toLowerCase();
                       const amount_sats = Number(lnChannelAmountSats || 0);
                       const sat_per_vbyte = Number(lnChannelSatPerVbyte || 0);
+                      if (typeof lnWalletSats === 'number' && Number.isFinite(lnWalletSats) && lnWalletSats > 0) {
+                        const feeBuffer = Math.max(
+                          LN_OPEN_TX_FEE_BUFFER_MIN_SATS,
+                          Math.trunc(Math.max(1, sat_per_vbyte || 0) * LN_OPEN_TX_WEIGHT_BUFFER_VB)
+                        );
+                        const anchorReserve = lnImpl === 'lnd' ? LND_NEW_ANCHOR_RESERVE_SATS : 0;
+                        const needMin = amount_sats + feeBuffer + anchorReserve;
+                        if (needMin > lnWalletSats) {
+                          pushToast(
+                            'error',
+                            `Open blocked: need about ${needMin} sats (amount ${amount_sats} + fee ${feeBuffer}${
+                              anchorReserve > 0 ? ` + anchor reserve ${anchorReserve}` : ''
+                            }), spendable is ${lnWalletSats} sats`
+                          );
+                          return;
+                        }
+                      }
                       const ok =
                         autoApprove ||
                         window.confirm(

@@ -655,7 +655,7 @@ test('e2e: promptd direct-tool mode drives full swap (LN regtest <-> Solana escr
     sessionId: takerSession,
     autoApprove: true,
     name: 'intercomswap_ln_fundchannel',
-    args: { node_id: makerNodeId, amount_sats: 1_000_000, private: true },
+    args: { node_id: makerNodeId, amount_sats: 1_000_000 },
   });
   await btcCli(['-rpcwallet=miner', 'generatetoaddress', '6', minerAddr]);
   await retry(async () => {
@@ -698,7 +698,7 @@ test('e2e: promptd direct-tool mode drives full swap (LN regtest <-> Solana escr
     sessionId: takerSession,
     autoApprove: true,
     name: 'intercomswap_ln_fundchannel',
-    args: { peer: `${makerNodeId}@cln-alice:9735`, amount_sats: 200_000, private: true },
+    args: { peer: `${makerNodeId}@cln-alice:9735`, amount_sats: 200_000 },
   });
   await btcCli(['-rpcwallet=miner', 'generatetoaddress', '6', minerAddr]);
 
@@ -864,39 +864,26 @@ test('e2e: promptd direct-tool mode drives full swap (LN regtest <-> Solana escr
   assert.equal(String(guardRfqPosted?.ln_liquidity?.mode || ''), 'aggregate');
   assert.ok(Number(guardRfqPosted?.ln_liquidity?.required_sats || 0) >= guardPassBtcSats);
 
-  // Explicit quote_accept reject path using a quote that exceeds single-channel liquidity.
-  const rejectQuote = await promptTool({
-    baseUrl: makerBase,
-    sessionId: makerSession,
-    autoApprove: true,
-    name: 'intercomswap_quote_post',
-    args: {
-      channel: guardRfqChannel,
-      trade_id: `${guardTradeId}-reject`,
-      rfq_id: crypto.randomBytes(32).toString('hex'),
-      btc_sats: guardRejectBtcSats,
-      usdt_amount: guardUsdtAmount,
-      trade_fee_collector: makerSolPk,
-      valid_for_sec: 120,
-    },
-  });
-  assert.equal(rejectQuote?.type, 'quote_posted');
-
+  // Quote-post reject path: maker cannot quote a BTC amount larger than their LN inbound.
   await assert.rejects(
     () =>
       promptTool({
-        baseUrl: takerBase,
-        sessionId: takerSession,
+        baseUrl: makerBase,
+        sessionId: makerSession,
         autoApprove: true,
-        name: 'intercomswap_quote_accept',
+        name: 'intercomswap_quote_post',
         args: {
           channel: guardRfqChannel,
-          quote_envelope: rejectQuote.envelope,
-          ln_liquidity_mode: 'single_channel',
+          trade_id: `${guardTradeId}-reject`,
+          rfq_id: crypto.randomBytes(32).toString('hex'),
+          btc_sats: guardRejectBtcSats,
+          usdt_amount: guardUsdtAmount,
+          trade_fee_collector: makerSolPk,
+          valid_for_sec: 120,
         },
       }),
-    /insufficient LN outbound liquidity \(mode=single_channel/i,
-    'quote_accept should reject when single channel cannot cover btc_sats'
+    /insufficient LN inbound liquidity \(mode=aggregate/i,
+    'quote_post should reject when maker inbound cannot cover btc_sats'
   );
 
   const passQuote = await promptTool({
