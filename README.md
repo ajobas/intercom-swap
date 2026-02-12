@@ -687,8 +687,11 @@ Recently added/changed tools and guardrails:
 - `intercomswap_ln_fundchannel`: supports `node_id` or `peer` (`nodeid@host:port`); if omitted and exactly one peer is connected, it auto-selects that peer.
 - `intercomswap_ln_listchannels` + `intercomswap_ln_closechannel`: channel inventory + close flow for channel management.
 - `intercomswap_rfq_post` / `intercomswap_quote_accept`: support `ln_liquidity_mode` (`single_channel` or `aggregate`).
+- `intercomswap_offer_post` / `intercomswap_quote_post` / `intercomswap_quote_post_from_rfq`: enforce maker-side LN inbound liquidity before posting lines/quotes.
 - `intercomswap_quote_accept`: embeds a signed best-effort `ln_liquidity_hint` in the accept envelope.
 - `intercomswap_swap_invite_from_accept`: optional `quote_envelope` argument enables stricter quote/hash cross-check plus best-effort taker liquidity hint validation before inviting.
+- `intercomswap_swap_ln_invoice_create_and_post`: now rejects early when maker inbound liquidity cannot receive `btc_sats`.
+- `intercomswap_swap_ln_pay_and_post_verified`: includes payer-side unroutable precheck + destination consistency checks and emits actionable LN route diagnostics on pay failures.
 - `intercomswap_tradeauto_start` / `intercomswap_tradeauto_status` / `intercomswap_tradeauto_stop`: backend multi-trade automation worker (quote/accept/invite/join/settlement orchestration).
   - quote source controls:
     - `enable_quote_from_offers`: quote RFQs only when a local Offer line matches.

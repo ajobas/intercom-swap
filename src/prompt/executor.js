@@ -189,6 +189,9 @@ const SOL_REFUND_MIN_SEC = 3600; // 1h
 const SOL_REFUND_MAX_SEC = 7 * 24 * 3600; // 1w
 const SOL_REFUND_DEFAULT_SEC = 72 * 3600; // 72h
 const SOL_TX_FEE_BUFFER_LAMPORTS = 50_000;
+const LN_OPEN_TX_FEE_BUFFER_MIN_SATS = 1_000;
+const LN_OPEN_TX_WEIGHT_BUFFER_VB = 600;
+const LND_NEW_ANCHOR_RESERVE_SATS = 10_000;
 const TERMINAL_TRADE_STATES = new Set(['claimed', 'refunded', 'canceled']);
 const ACTIVE_TRADE_STATES = new Set(['terms', 'accepted', 'invoice', 'escrow', 'ln_paid']);
 
@@ -271,8 +274,12 @@ function normalizeLnChannels({ impl, listChannels, listFunds }) {
       const local = parseSatsLike(ch?.local_balance) ?? 0n;
       const remote = parseSatsLike(ch?.remote_balance) ?? 0n;
       const cap = parseSatsLike(ch?.capacity) ?? local + remote;
+      const channelPoint = String(ch?.channel_point || '').trim();
+      const chanId = String(ch?.chan_id || '').trim();
       rows.push({
-        id: String(ch?.channel_point || ch?.chan_id || '').trim(),
+        id: String(channelPoint || chanId || '').trim(),
+        channel_point: channelPoint,
+        chan_id: chanId,
         peer: String(ch?.remote_pubkey || '').trim().toLowerCase(),
         state: String(ch?.active ? 'active' : 'inactive'),
         active: Boolean(ch?.active),
@@ -325,19 +332,90 @@ function summarizeLnLiquidity(rows) {
   let activeCount = 0;
   let maxOutbound = 0n;
   let totalOutbound = 0n;
+  let maxInbound = 0n;
+  let totalInbound = 0n;
   for (const row of rows) {
     if (!row?.active) continue;
     activeCount += 1;
     const local = typeof row.local_sats === 'bigint' ? row.local_sats : 0n;
+    const remote = typeof row.remote_sats === 'bigint' ? row.remote_sats : 0n;
     totalOutbound += local;
+    totalInbound += remote;
     if (local > maxOutbound) maxOutbound = local;
+    if (remote > maxInbound) maxInbound = remote;
   }
   return {
     channels_total: rows.length,
     channels_active: activeCount,
     max_outbound_sats: maxOutbound,
     total_outbound_sats: totalOutbound,
+    max_inbound_sats: maxInbound,
+    total_inbound_sats: totalInbound,
   };
+}
+
+function countInvoiceRouteHints(decoded) {
+  if (!isObject(decoded)) return 0;
+  let count = 0;
+  const collect = (value) => {
+    if (!Array.isArray(value)) return;
+    for (const row of value) {
+      if (Array.isArray(row)) {
+        if (row.length > 0) count += 1;
+        continue;
+      }
+      if (!isObject(row)) continue;
+      const hops = Array.isArray(row?.hop_hints) ? row.hop_hints : Array.isArray(row?.hopHints) ? row.hopHints : null;
+      if (hops && hops.length > 0) {
+        count += 1;
+        continue;
+      }
+      if (Object.keys(row).length > 0) count += 1;
+    }
+  };
+  collect(decoded.route_hints);
+  collect(decoded.routeHints);
+  collect(decoded.routing_hints);
+  collect(decoded.routingHints);
+  collect(decoded.blinded_paths);
+  collect(decoded.blindedPaths);
+  return count;
+}
+
+function extractInvoiceDestinationPubkey(decoded) {
+  if (!isObject(decoded)) return '';
+  const candidates = [
+    decoded.destination,
+    decoded.destination_pubkey,
+    decoded.destinationPubkey,
+    decoded.dest,
+    decoded.payee,
+    decoded.payee_pubkey,
+    decoded.node_id,
+    decoded.nodeId,
+  ];
+  for (const raw of candidates) {
+    const s = String(raw || '').trim().toLowerCase();
+    if (/^[0-9a-f]{66}$/i.test(s)) return s;
+  }
+  return '';
+}
+
+function extractInvoiceAmountSats(decoded) {
+  if (!isObject(decoded)) return null;
+  const satKeys = ['num_satoshis', 'num_sat', 'num_sats', 'amount_sat', 'amount_sats', 'satoshis'];
+  for (const key of satKeys) {
+    if (!(key in decoded)) continue;
+    const sat = parseSatsLike(decoded[key]);
+    if (sat !== null && sat > 0n) return sat;
+  }
+  const msatKeys = ['num_msat', 'num_millisatoshis', 'amount_msat', 'amount_millisatoshis'];
+  for (const key of msatKeys) {
+    if (!(key in decoded)) continue;
+    const msat = parseMsatLike(decoded[key]);
+    if (msat !== null && msat > 0n) return msat / 1000n;
+  }
+  return null;
 }
 
 function normalizeTradeState(value) {
@@ -438,6 +516,44 @@ async function assertLnOutboundLiquidity({ ln, requiredSats, mode, toolName }) {
     required_sats: toSafeNumber(required) ?? String(required),
     max_single_outbound_sats: toSafeNumber(s.max_outbound_sats) ?? String(s.max_outbound_sats),
     total_outbound_sats: toSafeNumber(s.total_outbound_sats) ?? String(s.total_outbound_sats),
+    active_channels: s.channels_active,
+  };
+}
+
+async function assertLnInboundLiquidity({ ln, requiredSats, mode, toolName }) {
+  const required = BigInt(String(requiredSats || 0));
+  if (required < 0n) throw new Error(`${toolName}: required_sats must be >= 0`);
+  const m = String(mode || 'single_channel').trim().toLowerCase();
+  if (m !== 'single_channel' && m !== 'aggregate') {
+    throw new Error(`${toolName}: ln_liquidity_mode must be single_channel or aggregate`);
+  }
+
+  const [listFunds, listChannels] = await Promise.all([lnListFunds(ln), lnListChannels(ln)]);
+  const rows = normalizeLnChannels({ impl: ln?.impl, listChannels, listFunds });
+  const s = summarizeLnLiquidity(rows);
+  if (s.channels_active < 1) {
+    throw new Error(`${toolName}: no active Lightning channels (cannot receive BTC leg)`);
+  }
+  const have = m === 'aggregate' ? s.total_inbound_sats : s.max_inbound_sats;
+  if (required > 0n && have < required) {
+    const need = toSafeNumber(required);
+    const haveNum = toSafeNumber(have);
+    const maxNum = toSafeNumber(s.max_inbound_sats);
+    const totalNum = toSafeNumber(s.total_inbound_sats);
+    throw new Error(
+      `${toolName}: insufficient LN inbound liquidity (mode=${m}, need_sats=${need ?? String(required)}, have_sats=${
+        haveNum ?? String(have)
+      }, max_single_sats=${maxNum ?? String(s.max_inbound_sats)}, total_inbound_sats=${
+        totalNum ?? String(s.total_inbound_sats)
+      }, active_channels=${s.channels_active})`
+    );
+  }
+  return {
+    ok: true,
+    mode: m,
+    required_sats: toSafeNumber(required) ?? String(required),
+    max_single_inbound_sats: toSafeNumber(s.max_inbound_sats) ?? String(s.max_inbound_sats),
+    total_inbound_sats: toSafeNumber(s.total_inbound_sats) ?? String(s.total_inbound_sats),
     active_channels: s.channels_active,
   };
 }
@@ -2674,6 +2790,14 @@ export class ToolExecutor {
         });
       }
 
+      const maxOfferBtcSats = maxOffers.reduce((max, row) => Math.max(max, Number(row?.btc_sats || 0)), 0);
+      const lnInboundCheck = await assertLnInboundLiquidity({
+        ln: this.ln,
+        requiredSats: Math.max(0, Math.trunc(maxOfferBtcSats)),
+        mode: 'aggregate',
+        toolName,
+      });
+
       const programId = this._programId().toBase58();
       const appHash = deriveIntercomswapAppHash({ solanaProgramId: programId, appTag: INTERCOMSWAP_APP_TAG });
       let fundingCheck = { ok: true, skipped: true, reason: 'solana.usdt_mint not configured' };
@@ -2755,7 +2879,15 @@ export class ToolExecutor {
         for (const ch of channels) {
           await this._sendEnvelopeLogged(sc, ch, signed);
         }
-        return { type: 'offer_posted', channels, rfq_channels: rfqChannels, svc_announce_id: svcAnnounceId, envelope: signed, funding_check: fundingCheck };
+        return {
+          type: 'offer_posted',
+          channels,
+          rfq_channels: rfqChannels,
+          svc_announce_id: svcAnnounceId,
+          envelope: signed,
+          funding_check: fundingCheck,
+          ln_liquidity: lnInboundCheck,
+        };
       });
     }
     if (toolName === 'intercomswap_rfq_post') {
@@ -2935,6 +3067,12 @@ export class ToolExecutor {
         totalFeeBps: platformFeeBps + tradeFeeBps,
         context: 'quote',
       });
+      const lnInboundCheck = await assertLnInboundLiquidity({
+        ln: this.ln,
+        requiredSats: btcSats,
+        mode: 'aggregate',
+        toolName,
+      });
 
       const appHash = deriveIntercomswapAppHash({ solanaProgramId: programId.toBase58() });
 
@@ -2963,7 +3101,14 @@ export class ToolExecutor {
       return withScBridge(this.scBridge, async (sc) => {
         const signed = signSwapEnvelope(unsigned, signing);
         await this._sendEnvelopeLogged(sc, channel, signed);
-        return { type: 'quote_posted', channel, quote_id: quoteId, envelope: signed, funding_check: fundingCheck };
+        return {
+          type: 'quote_posted',
+          channel,
+          quote_id: quoteId,
+          envelope: signed,
+          funding_check: fundingCheck,
+          ln_liquidity: lnInboundCheck,
+        };
       });
     }
 
@@ -3081,6 +3226,12 @@ export class ToolExecutor {
         totalFeeBps: platformFeeBps + tradeFeeBps,
         context: `rfq:${rfqId}`,
       });
+      const lnInboundCheck = await assertLnInboundLiquidity({
+        ln: this.ln,
+        requiredSats: btcSats,
+        mode: 'aggregate',
+        toolName,
+      });
 
       const appHash = deriveIntercomswapAppHash({ solanaProgramId: programId.toBase58() });
       const rfqAppHash = String(rfq?.body?.app_hash || '').trim().toLowerCase();
@@ -3113,7 +3264,15 @@ export class ToolExecutor {
       return withScBridge(this.scBridge, async (sc) => {
         const signed = signSwapEnvelope(unsigned, signing);
         await this._sendEnvelopeLogged(sc, channel, signed);
-        return { type: 'quote_posted', channel, quote_id: quoteId, envelope: signed, rfq_id: rfqId, funding_check: fundingCheck };
+        return {
+          type: 'quote_posted',
+          channel,
+          quote_id: quoteId,
+          envelope: signed,
+          rfq_id: rfqId,
+          funding_check: fundingCheck,
+          ln_liquidity: lnInboundCheck,
+        };
       });
     }
 
@@ -4522,6 +4681,38 @@ export class ToolExecutor {
           amount_sats: amountSats,
           sat_per_vbyte: satPerVbyte,
         };
+
+      // LND uses anchor channels by default and enforces wallet reserve for fee bumping.
+      // Precheck here to fail early with clear numbers instead of surfacing opaque lncli errors.
+      if (String(this.ln?.impl || '').trim().toLowerCase() === 'lnd') {
+        try {
+          const funds = await lnListFunds(this.ln);
+          const wallet = isObject(funds?.wallet) ? funds.wallet : {};
+          const confirmed = Number.parseInt(String(wallet?.confirmed_balance || '0'), 10);
+          const locked = Number.parseInt(String(wallet?.locked_balance || '0'), 10);
+          const reservedAnchor = Number.parseInt(String(wallet?.reserved_balance_anchor_chan || '0'), 10);
+          const confirmedSats = Number.isFinite(confirmed) ? Math.max(0, Math.trunc(confirmed)) : 0;
+          const lockedSats = Number.isFinite(locked) ? Math.max(0, Math.trunc(locked)) : 0;
+          const reservedAnchorSats = Number.isFinite(reservedAnchor) ? Math.max(0, Math.trunc(reservedAnchor)) : 0;
+          const spendableSats = Math.max(0, confirmedSats - lockedSats - reservedAnchorSats);
+          const feeBufferSats = Math.max(
+            LN_OPEN_TX_FEE_BUFFER_MIN_SATS,
+            Math.trunc(Math.max(1, Number(satPerVbyte || 0)) * LN_OPEN_TX_WEIGHT_BUFFER_VB)
+          );
+          const minNeededSats = amountSats + feeBufferSats + LND_NEW_ANCHOR_RESERVE_SATS;
+          if (minNeededSats > spendableSats) {
+            throw new Error(
+              `${toolName}: insufficient spendable wallet funds for channel open (LND anchor reserve). ` +
+                `need about ${minNeededSats} sats = amount ${amountSats} + fee_buffer ${feeBufferSats} + new_anchor_reserve ${LND_NEW_ANCHOR_RESERVE_SATS}; ` +
+                `have spendable ${spendableSats} sats (confirmed ${confirmedSats}, locked ${lockedSats}, reserved_anchor ${reservedAnchorSats}). ` +
+                'Reduce amount_sats or fund wallet.'
+            );
+          }
+        } catch (err) {
+          const msg = String(err?.message || err || '').trim();
+          if (msg.startsWith(`${toolName}: insufficient spendable wallet funds`)) throw err;
+        }
+      }
       return lnFundChannel(this.ln, { nodeId, amountSats, satPerVbyte, block: true });
     }
     if (toolName === 'intercomswap_ln_splice') {
@@ -4729,6 +4920,12 @@ export class ToolExecutor {
 
       const store = await this._openReceiptsStore({ required: true });
       try {
+      const lnInboundCheck = await assertLnInboundLiquidity({
+        ln: this.ln,
+        requiredSats: btcSats,
+        mode: 'aggregate',
+        toolName,
+      });
       const amountMsat = (BigInt(String(btcSats)) * 1000n).toString();
       const invoice = await lnInvoice(this.ln, {
         amountMsat,
@@ -4795,6 +4992,7 @@ export class ToolExecutor {
         payment_hash_hex: paymentHashHex,
         bolt11,
         expires_at_unix: expiresAtUnix,
+        ln_liquidity: lnInboundCheck,
         envelope_handle: envHandle,
         envelope: envHandle ? null : signed,
       };
@@ -5220,7 +5418,137 @@ export class ToolExecutor {
         }, { label: 'swap_verify_pre_pay' });
         if (!verifyRes.ok) throw new Error(`${toolName}: pre-pay verification failed: ${verifyRes.error}`);
 
-        const payRes = await lnPay(this.ln, { bolt11 });
+        const lnImpl = String(this?.ln?.impl || '').trim().toLowerCase();
+        const termsLnReceiverPeer = String(terms?.body?.ln_receiver_peer || '').trim().toLowerCase();
+        let decodedPay = null;
+        let destinationPubkey = '';
+        let routeHintCount = null;
+        try {
+          decodedPay = await lnDecodePay(this.ln, { bolt11 });
+          destinationPubkey = extractInvoiceDestinationPubkey(decodedPay);
+          routeHintCount = countInvoiceRouteHints(decodedPay);
+        } catch (_e) {}
+
+        if (destinationPubkey && /^[0-9a-f]{66}$/i.test(termsLnReceiverPeer) && destinationPubkey !== termsLnReceiverPeer) {
+          throw new Error(
+            `${toolName}: pre-pay verification failed: invoice destination mismatch vs terms.ln_receiver_peer (${destinationPubkey} != ${termsLnReceiverPeer})`
+          );
+        }
+
+        const termsBtcSats = toPositiveIntOrNull(terms?.body?.btc_sats);
+        const decodedBtcSats = extractInvoiceAmountSats(decodedPay);
+        const requiredBtcSats = termsBtcSats !== null ? BigInt(termsBtcSats) : decodedBtcSats;
+
+        let routingRows = [];
+        let routingSummary = null;
+        let activePublic = 0;
+        let directActiveChannel = null;
+        try {
+          const [listFunds, listChannels] = await Promise.all([lnListFunds(this.ln), lnListChannels(this.ln)]);
+          routingRows = normalizeLnChannels({ impl: this?.ln?.impl, listChannels, listFunds });
+          routingSummary = summarizeLnLiquidity(routingRows);
+          for (const row of routingRows) {
+            if (!row?.active) continue;
+            if (!row?.private) activePublic += 1;
+            if (destinationPubkey && String(row?.peer || '').trim().toLowerCase() === destinationPubkey) {
+              const local = typeof row.local_sats === 'bigint' ? row.local_sats : 0n;
+              if (!directActiveChannel || local > directActiveChannel.local_sats) {
+                const outgoingChanId = String(row?.chan_id || '').trim();
+                directActiveChannel = {
+                  id: String(row?.id || '').trim(),
+                  outgoing_chan_id: /^[0-9]+$/.test(outgoingChanId) ? outgoingChanId : '',
+                  peer: String(row?.peer || '').trim().toLowerCase(),
+                  local_sats: local,
+                };
+              }
+            }
+          }
+        } catch (_e) {}
+
+        if (routingSummary && Number(routingSummary.channels_active || 0) < 1) {
+          throw new Error(`${toolName}: unroutable invoice precheck: payer has no active Lightning channels`);
+        }
+        if (
+          routingSummary &&
+          requiredBtcSats !== null &&
+          requiredBtcSats > 0n &&
+          routingSummary.total_outbound_sats < requiredBtcSats
+        ) {
+          throw new Error(
+            `${toolName}: unroutable invoice precheck: insufficient outbound liquidity for invoice (need_sats=${
+              toSafeNumber(requiredBtcSats) ?? String(requiredBtcSats)
+            }, have_total_outbound_sats=${
+              toSafeNumber(routingSummary.total_outbound_sats) ?? String(routingSummary.total_outbound_sats)
+            }, have_max_single_outbound_sats=${
+              toSafeNumber(routingSummary.max_outbound_sats) ?? String(routingSummary.max_outbound_sats)
+            })`
+          );
+        }
+        if (
+          lnImpl === 'lnd' &&
+          destinationPubkey &&
+          Number(activePublic || 0) < 1 &&
+          Number(routeHintCount || 0) < 1 &&
+          !directActiveChannel
+        ) {
+          throw new Error(
+            `${toolName}: unroutable invoice precheck: destination ${destinationPubkey} has no route hints and this node has no direct active channel to destination`
+          );
+        }
+
+        const payArgs = { bolt11 };
+        if (
+          lnImpl === 'lnd' &&
+          directActiveChannel &&
+          directActiveChannel.outgoing_chan_id &&
+          requiredBtcSats !== null &&
+          requiredBtcSats > 0n &&
+          directActiveChannel.local_sats >= requiredBtcSats
+        ) {
+          payArgs.outgoingChanId = directActiveChannel.outgoing_chan_id;
+          if (destinationPubkey) payArgs.lastHopPubkey = destinationPubkey;
+        }
+
+        let payRes;
+        try {
+          payRes = await lnPay(this.ln, payArgs);
+        } catch (err) {
+          const msg = String(err?.message || err || '');
+          const lower = msg.toLowerCase();
+          const hints = [];
+          if (destinationPubkey) hints.push(`invoice_destination=${destinationPubkey}`);
+          if (requiredBtcSats !== null) hints.push(`invoice_sats=${toSafeNumber(requiredBtcSats) ?? String(requiredBtcSats)}`);
+          if (Number.isFinite(routeHintCount)) hints.push(`invoice_route_hints=${routeHintCount}`);
+          if (routingSummary) {
+            hints.push(`active_channels=${routingSummary.channels_active}`);
+            hints.push(
+              `max_outbound_sats=${toSafeNumber(routingSummary.max_outbound_sats) ?? String(routingSummary.max_outbound_sats)}`
+            );
+            hints.push(
+              `total_outbound_sats=${toSafeNumber(routingSummary.total_outbound_sats) ?? String(routingSummary.total_outbound_sats)}`
+            );
+            hints.push(
+              `max_inbound_sats=${toSafeNumber(routingSummary.max_inbound_sats) ?? String(routingSummary.max_inbound_sats)}`
+            );
+            hints.push(
+              `total_inbound_sats=${toSafeNumber(routingSummary.total_inbound_sats) ?? String(routingSummary.total_inbound_sats)}`
+            );
+          }
+          if (directActiveChannel) {
+            hints.push(`direct_channel_id=${directActiveChannel.id}`);
+            if (directActiveChannel.outgoing_chan_id) hints.push(`direct_channel_chan_id=${directActiveChannel.outgoing_chan_id}`);
+            hints.push(`direct_channel_local_sats=${toSafeNumber(directActiveChannel.local_sats) ?? String(directActiveChannel.local_sats)}`);
+          }
+          if (
+            lower.includes('unable to find a path') ||
+            lower.includes('no_route') ||
+            lower.includes('no route') ||
+            lower.includes('route not found')
+          ) {
+            hints.push('NO_ROUTE from node; check that payee has inbound liquidity and at least one routable path from payer');
+          }
+          throw new Error(`${toolName}: ln pay failed: ${msg}${hints.length > 0 ? ` (hint: ${hints.join('; ')})` : ''}`);
+        }
         const preimageHex = String(payRes?.payment_preimage || '').trim().toLowerCase();
         if (!/^[0-9a-f]{64}$/.test(preimageHex)) throw new Error(`${toolName}: missing payment_preimage`);
         const gotHash = computePaymentHashFromPreimage(preimageHex);

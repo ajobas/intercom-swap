@@ -1455,6 +1455,9 @@ Lightning channel note:
 - Channel policy note:
   - Channel opening is public-only in this stack (no private-channel toggle).
   - Invoice creation follows normal routing behavior; settlement requires reachable routes and receiver inbound.
+  - Maker-side quote/offer posting (`intercomswap_offer_post`, `intercomswap_quote_post`, `intercomswap_quote_post_from_rfq`) now hard-fails early on insufficient LN inbound liquidity.
+  - Maker invoice posting (`intercomswap_swap_ln_invoice_create_and_post`) also hard-fails on insufficient inbound for the negotiated BTC amount.
+  - Payer settlement (`intercomswap_swap_ln_pay_and_post_verified`) performs an unroutable precheck (destination consistency + channel/liquidity diagnostics) before/around `ln_pay` so failures are explicit instead of opaque retry churn.
 - Collin will block RFQ/Offer/Bot tools until at least one LN channel exists (to prevent “can’t settle” operator footguns).
 
 Autopost (Collin "Run as bot") safety:
