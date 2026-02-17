@@ -864,11 +864,27 @@ Edit `onchain/prompt/setup.json`:
 - `llm.base_url`: your OpenAI-compatible REST API base (typically ends with `/v1`)
 - `llm.model`: model id to use
 - `llm.api_key`: optional (use `""` if not required)
-- `llm.tools_compact` (default `true`): send compacted tool schemas to the LLM (recommended for 32k-context models).
+- `llm.call_style`: `openai` or `functiongemma`
+  - if omitted, promptd auto-detects `functiongemma` when `llm.model` contains `functiongemma`; otherwise `openai`
+- `llm.prompt_profile`:
+  - `default` (full IntercomSwap system/tool policy)
+  - `functiongemma_minimal` (lean prompt intended for FunctionGemma-style tool callers)
+- `llm.tool_schema_profile`:
+  - `full` (entire tool schemas)
+  - `compact` (default for `openai`; reduced schema verbosity)
+  - `minimal` (default for `functiongemma`; required fields only)
+  - `names_only` (tool names + empty parameter schema; smallest payload)
+- legacy: `llm.tools_compact` (default `true`): maps to `tool_schema_profile=compact` (or `full` when set to `false`) if `llm.tool_schema_profile` is not set.
   - `llm.tools_compact_keep_tool_descriptions` (default `true`)
   - `llm.tools_compact_keep_schema_descriptions` (default `false`)
 - `llm.tools_select_pass` (default `false`): optional two-pass prompting (select tool names first, then run tool-calling with only those tools).
   - `llm.tools_select_max_tools` (default `16`)
+- FunctionGemma tip: do not force OpenAI `response_format` JSON mode unless you specifically need it.
+- FunctionGemma runtime profile (recommended explicit config):
+  - `llm.call_style: "functiongemma"`
+  - `llm.prompt_profile: "functiongemma_minimal"`
+  - `llm.tool_schema_profile: "minimal"`
+  - omit `llm.response_format` unless required by your backend
 - `peer.keypair`: path to the peer wallet keypair file (usually `stores/<store>/db/keypair.json`) so tools can sign sidechannel envelopes locally
 - optional sampling params: `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `repetition_penalty`
 - `sc_bridge.token` or `sc_bridge.token_file`

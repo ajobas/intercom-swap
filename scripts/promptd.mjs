@@ -219,6 +219,12 @@ async function main() {
             base_url: 'http://127.0.0.1:8000/v1',
             api_key: '',
             model: 'your-model-id',
+            // openai (default) | functiongemma
+            call_style: 'openai',
+            // default | functiongemma_minimal
+            prompt_profile: 'default',
+            // full | compact | minimal | names_only
+            tool_schema_profile: 'compact',
             max_tokens: 8000,
             temperature: 0.4,
             top_p: 0.95,
@@ -623,7 +629,14 @@ async function main() {
           port: setup.server.port,
           tls: Boolean(tls),
           audit_dir: setup.server.auditDir,
-          llm: { base_url: setup.llm.baseUrl, model: setup.llm.model, tool_format: setup.llm.toolFormat },
+          llm: {
+            base_url: setup.llm.baseUrl,
+            model: setup.llm.model,
+            tool_format: setup.llm.toolFormat,
+            call_style: setup.llm.callStyle,
+            prompt_profile: setup.llm.promptProfile,
+            tool_schema_profile: setup.llm.toolSchemaProfile,
+          },
           tradeauto_bootstrap: {
             enabled: tradeAutoBootstrap.enabled,
             channels: tradeAutoBootstrap.channels,

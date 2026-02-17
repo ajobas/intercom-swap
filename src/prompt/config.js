@@ -20,6 +20,21 @@ function normalizeString(value, { allowEmpty = false } = {}) {
   return s;
 }
 
+function normalizeEnum(value, allowed, fallback) {
+  const s = String(value ?? '').trim().toLowerCase();
+  if (allowed.has(s)) return s;
+  return fallback;
+}
+
+function inferCallStyleFromModel(modelName) {
+  const s = String(modelName ?? '').trim().toLowerCase();
+  if (!s) return 'openai';
+  // Treat functiongemma-named checkpoints as FunctionGemma call-style by default,
+  // unless the user explicitly overrides llm.call_style.
+  if (/function[\s._-]*gemma/.test(s)) return 'functiongemma';
+  return 'openai';
+}
+
 function normalizeApiKey(value) {
   const s = normalizeString(value, { allowEmpty: true });
   if (!s) return '';
@@ -121,6 +136,7 @@ export const DEFAULT_PROMPT_SETUP_PATH = 'onchain/prompt/setup.json';
   };
 
   const llmRaw = isObject(raw.llm) ? raw.llm : {};
+  const llmModel = normalizeString(llmRaw.model);
   const llmResponseFormat = isObject(llmRaw.response_format) ? llmRaw.response_format : null;
   const llmExtraBody = isObject(llmRaw.extra_body) ? llmRaw.extra_body : null;
   const llmToolsCompactRaw = parseBoolLike(llmRaw.tools_compact, null);
@@ -128,10 +144,31 @@ export const DEFAULT_PROMPT_SETUP_PATH = 'onchain/prompt/setup.json';
   const llmKeepSchemaDescriptionsRaw = parseBoolLike(llmRaw.tools_compact_keep_schema_descriptions, null);
   const llmToolsSelectPassRaw = parseBoolLike(llmRaw.tools_select_pass, null);
   const llmToolsSelectMaxToolsRaw = parseIntLike(llmRaw.tools_select_max_tools, null);
+  const llmCallStyleRaw = normalizeString(llmRaw.call_style, { allowEmpty: true });
+  const llmCallStyle = llmCallStyleRaw
+    ? normalizeEnum(llmCallStyleRaw, new Set(['openai', 'functiongemma']), 'openai')
+    : inferCallStyleFromModel(llmModel);
+  const llmPromptProfileRaw = normalizeString(llmRaw.prompt_profile, { allowEmpty: true });
+  const llmPromptProfile = llmPromptProfileRaw
+    ? normalizeEnum(llmPromptProfileRaw, new Set(['default', 'functiongemma_minimal']), 'default')
+    : llmCallStyle === 'functiongemma'
+      ? 'functiongemma_minimal'
+      : 'default';
+  const llmToolSchemaProfileRaw = normalizeString(llmRaw.tool_schema_profile, { allowEmpty: true });
+  const llmToolSchemaProfile = llmToolSchemaProfileRaw
+    ? normalizeEnum(llmToolSchemaProfileRaw, new Set(['full', 'compact', 'minimal', 'names_only']), 'compact')
+    : llmCallStyle === 'functiongemma'
+      ? 'minimal'
+      : llmToolsCompactRaw === false
+        ? 'full'
+        : 'compact';
   const llm = {
     baseUrl: normalizeString(llmRaw.base_url),
     apiKey: normalizeApiKey(llmRaw.api_key),
-    model: normalizeString(llmRaw.model),
+    model: llmModel,
+    callStyle: llmCallStyle,
+    promptProfile: llmPromptProfile,
+    toolSchemaProfile: llmToolSchemaProfile,
     maxTokens: parseIntLike(llmRaw.max_tokens, 0) ?? 0,
     temperature: parseFloatLike(llmRaw.temperature, null),
     topP: parseFloatLike(llmRaw.top_p, null),
@@ -142,7 +179,8 @@ export const DEFAULT_PROMPT_SETUP_PATH = 'onchain/prompt/setup.json';
     timeoutMs: parseIntLike(llmRaw.timeout_ms, 120_000) ?? 120_000,
     responseFormat: llmResponseFormat,
     extraBody: llmExtraBody,
-    toolsCompact: llmToolsCompactRaw === null ? true : Boolean(llmToolsCompactRaw),
+    // Legacy toggle kept for backward compatibility; toolSchemaProfile now controls this explicitly.
+    toolsCompact: llmToolsCompactRaw === null ? llmToolSchemaProfile !== 'full' : Boolean(llmToolsCompactRaw),
     toolsCompactKeepToolDescriptions: llmKeepToolDescriptionsRaw === null ? true : Boolean(llmKeepToolDescriptionsRaw),
     toolsCompactKeepSchemaDescriptions: llmKeepSchemaDescriptionsRaw === null ? false : Boolean(llmKeepSchemaDescriptionsRaw),
     toolsSelectPass: llmToolsSelectPassRaw === null ? false : Boolean(llmToolsSelectPassRaw),

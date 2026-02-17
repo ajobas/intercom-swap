@@ -359,6 +359,56 @@ test('prompt router: deterministic RFQ autopost parsing tolerates explicit "rfq"
   assert.equal(llmCalls, 0);
 });
 
+test('prompt router: parses simple "buy btc for usdt, repeat every" into an Offer autopost (no LLM)', async () => {
+  let llmCalls = 0;
+  const llmClient = {
+    chatCompletions: async () => {
+      llmCalls += 1;
+      throw new Error('LLM should not be called for deterministic Offer autopost prompts');
+    },
+  };
+
+  const toolExecutor = {
+    execute: async (name, args) => {
+      assert.equal(name, 'intercomswap_autopost_start');
+      assert.equal(args.tool, 'intercomswap_offer_post');
+      assert.equal(args.interval_sec, 10);
+      assert.equal(args.ttl_sec, 24 * 3600);
+      assert.ok(args.args && typeof args.args === 'object');
+      assert.ok(Array.isArray(args.args.offers) && args.args.offers.length > 0);
+      assert.equal(args.args.offers[0].btc_sats, 10000000);
+      assert.equal(args.args.offers[0].usdt_amount, '1000');
+      return { type: 'autopost_started', name: args.name };
+    },
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-prompt-'));
+  const router = new PromptRouter({
+    llmConfig: {
+      baseUrl: 'http://stub/',
+      apiKey: '',
+      model: 'stub',
+      maxTokens: 0,
+      temperature: null,
+      topP: null,
+      topK: null,
+      minP: null,
+      repetitionPenalty: null,
+      toolFormat: 'tools',
+      timeoutMs: 1000,
+    },
+    llmClient,
+    toolExecutor,
+    auditDir: tmpDir,
+    maxSteps: 4,
+  });
+
+  const out = await router.run({ prompt: 'place an offer. i want to buy 0.1 btc for 1000 usdt. repeat every 10s for a day', autoApprove: true, dryRun: true });
+  assert.ok(out && typeof out === 'object');
+  assert.equal(out.content_json?.type, 'autopost_started');
+  assert.equal(llmCalls, 0);
+});
+
 test('audit log: redacts sensitive keys', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-audit-'));
   const log = new AuditLog({ dir: tmpDir, sessionId: 'sess1' });
@@ -467,4 +517,251 @@ test('prompt router: falls back to tool-selection pass on context-limit errors',
   const out = await router.run({ prompt: 'hi', autoApprove: true });
   assert.deepEqual(out.content_json, { type: 'message', text: 'ok' });
   assert.equal(calls, 4);
+});
+
+test('prompt router: parses FunctionGemma call syntax from assistant text', async () => {
+  let calls = 0;
+  const llmClient = {
+    chatCompletions: async ({ messages }) => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          raw: null,
+          message: { role: 'assistant', content: '<start_function_call>call:intercomswap_sc_info({})<end_function_call>' },
+          content: '<start_function_call>call:intercomswap_sc_info({})<end_function_call>',
+          toolCalls: [],
+          finishReason: 'stop',
+          usage: null,
+        };
+      }
+
+      const hasToolMsg = messages.some((m) => m && m.role === 'tool');
+      assert.equal(hasToolMsg, true);
+      return {
+        raw: null,
+        message: { role: 'assistant', content: '{"type":"message","text":"ok"}' },
+        content: '{"type":"message","text":"ok"}',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: null,
+      };
+    },
+  };
+
+  const toolExecutor = {
+    execute: async (name, args) => {
+      assert.equal(name, 'intercomswap_sc_info');
+      assert.deepEqual(args, {});
+      return { type: 'info', ok: true };
+    },
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-prompt-'));
+  const router = new PromptRouter({
+    llmConfig: {
+      baseUrl: 'http://stub/',
+      apiKey: '',
+      model: 'stub',
+      callStyle: 'functiongemma',
+      promptProfile: 'functiongemma_minimal',
+      toolSchemaProfile: 'minimal',
+      maxTokens: 0,
+      temperature: null,
+      topP: null,
+      topK: null,
+      minP: null,
+      repetitionPenalty: null,
+      toolFormat: 'tools',
+      timeoutMs: 1000,
+    },
+    llmClient,
+    toolExecutor,
+    auditDir: tmpDir,
+    maxSteps: 4,
+  });
+
+  const out = await router.run({ prompt: 'hi', autoApprove: true });
+  assert.deepEqual(out.content_json, { type: 'message', text: 'ok' });
+});
+
+test('prompt router: parses FunctionGemma bare start_function_call syntax', async () => {
+  let calls = 0;
+  const llmClient = {
+    chatCompletions: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          raw: null,
+          message: { role: 'assistant', content: '<start_function_call>intercomswap_sc_info({})<end_function_call>' },
+          content: '<start_function_call>intercomswap_sc_info({})<end_function_call>',
+          toolCalls: [],
+          finishReason: 'stop',
+          usage: null,
+        };
+      }
+      return {
+        raw: null,
+        message: { role: 'assistant', content: '{"type":"message","text":"done"}' },
+        content: '{"type":"message","text":"done"}',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: null,
+      };
+    },
+  };
+
+  let seen = 0;
+  const toolExecutor = {
+    execute: async (name, args) => {
+      seen += 1;
+      assert.equal(name, 'intercomswap_sc_info');
+      assert.deepEqual(args, {});
+      return { ok: true };
+    },
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-prompt-'));
+  const router = new PromptRouter({
+    llmConfig: {
+      baseUrl: 'http://stub/',
+      apiKey: '',
+      model: 'stub',
+      callStyle: 'functiongemma',
+      promptProfile: 'functiongemma_minimal',
+      toolSchemaProfile: 'minimal',
+      maxTokens: 0,
+      temperature: null,
+      topP: null,
+      topK: null,
+      minP: null,
+      repetitionPenalty: null,
+      toolFormat: 'tools',
+      timeoutMs: 1000,
+    },
+    llmClient,
+    toolExecutor,
+    auditDir: tmpDir,
+    maxSteps: 4,
+  });
+
+  const out = await router.run({ prompt: 'hi', autoApprove: true });
+  assert.equal(seen, 1);
+  assert.deepEqual(out.content_json, { type: 'message', text: 'done' });
+});
+
+test('prompt router: parses FunctionGemma double-brace args wrapper', async () => {
+  let calls = 0;
+  const llmClient = {
+    chatCompletions: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return {
+          raw: null,
+          message: { role: 'assistant', content: '<start_function_call>call:intercomswap_sc_join{{"channel":"0000intercomswapbtcusdt"}}<end_function_call>' },
+          content: '<start_function_call>call:intercomswap_sc_join{{"channel":"0000intercomswapbtcusdt"}}<end_function_call>',
+          toolCalls: [],
+          finishReason: 'stop',
+          usage: null,
+        };
+      }
+      return {
+        raw: null,
+        message: { role: 'assistant', content: '{"type":"message","text":"ok"}' },
+        content: '{"type":"message","text":"ok"}',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: null,
+      };
+    },
+  };
+
+  let seen = 0;
+  const toolExecutor = {
+    execute: async (name, args) => {
+      seen += 1;
+      assert.equal(name, 'intercomswap_sc_join');
+      assert.deepEqual(args, { channel: '0000intercomswapbtcusdt' });
+      return { ok: true };
+    },
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-prompt-'));
+  const router = new PromptRouter({
+    llmConfig: {
+      baseUrl: 'http://stub/',
+      apiKey: '',
+      model: 'stub',
+      callStyle: 'functiongemma',
+      promptProfile: 'functiongemma_minimal',
+      toolSchemaProfile: 'minimal',
+      maxTokens: 0,
+      temperature: null,
+      topP: null,
+      topK: null,
+      minP: null,
+      repetitionPenalty: null,
+      toolFormat: 'tools',
+      timeoutMs: 1000,
+    },
+    llmClient,
+    toolExecutor,
+    auditDir: tmpDir,
+    maxSteps: 4,
+  });
+
+  const out = await router.run({ prompt: 'join', autoApprove: true });
+  assert.equal(seen, 1);
+  assert.deepEqual(out.content_json, { type: 'message', text: 'ok' });
+});
+
+test('prompt router: names_only tool schema profile sends empty parameter schemas', async () => {
+  let capturedTools = null;
+  const llmClient = {
+    chatCompletions: async ({ tools }) => {
+      capturedTools = tools;
+      return {
+        raw: null,
+        message: { role: 'assistant', content: '{"type":"message","text":"ok"}' },
+        content: '{"type":"message","text":"ok"}',
+        toolCalls: [],
+        finishReason: 'stop',
+        usage: null,
+      };
+    },
+  };
+
+  const toolExecutor = {
+    execute: async () => ({ ok: true }),
+  };
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intercomswap-prompt-'));
+  const router = new PromptRouter({
+    llmConfig: {
+      baseUrl: 'http://stub/',
+      apiKey: '',
+      model: 'stub',
+      callStyle: 'functiongemma',
+      promptProfile: 'functiongemma_minimal',
+      toolSchemaProfile: 'names_only',
+      maxTokens: 0,
+      temperature: null,
+      topP: null,
+      topK: null,
+      minP: null,
+      repetitionPenalty: null,
+      toolFormat: 'tools',
+      timeoutMs: 1000,
+    },
+    llmClient,
+    toolExecutor,
+    auditDir: tmpDir,
+    maxSteps: 1,
+  });
+
+  const out = await router.run({ prompt: 'status', autoApprove: false });
+  assert.deepEqual(out.content_json, { type: 'message', text: 'ok' });
+  assert.ok(Array.isArray(capturedTools) && capturedTools.length > 0);
+  const sample = capturedTools.find((t) => t?.function?.name === 'intercomswap_sc_info');
+  assert.ok(sample);
+  assert.deepEqual(sample.function.parameters, { type: 'object', additionalProperties: true, properties: {} });
 });

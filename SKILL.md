@@ -281,9 +281,21 @@ Edit `onchain/prompt/setup.json`:
 - `llm.base_url`: your OpenAI-compatible REST API base (must end with `/v1` for most servers)
 - `llm.model`: model id to use
 - `llm.api_key`: optional (use `""` if not required)
+- `llm.call_style`: `openai` or `functiongemma`
+  - if omitted, promptd auto-detects `functiongemma` when `llm.model` contains `functiongemma`; otherwise `openai`
+- `llm.prompt_profile`: `default` or `functiongemma_minimal` (recommended with `call_style=functiongemma`)
+- `llm.tool_schema_profile`: `full` | `compact` | `minimal` | `names_only`
+  - default with `call_style=openai`: `compact`
+  - default with `call_style=functiongemma`: `minimal`
+- legacy compatibility: if `llm.tool_schema_profile` is omitted, `llm.tools_compact=false` maps to `full`; otherwise `compact`.
+- FunctionGemma runtime profile (recommended explicit config):
+  - `llm.call_style: "functiongemma"`
+  - `llm.prompt_profile: "functiongemma_minimal"`
+  - `llm.tool_schema_profile: "minimal"`
+  - omit `llm.response_format` unless your backend requires it
 - `peer.keypair`: path to the peer wallet keypair file (usually `stores/<store>/db/keypair.json`) so tools can sign sidechannel envelopes locally
 - `sc_bridge.token` or `sc_bridge.token_file`: SC‑Bridge auth
-- `ln.wallet_password_file`: recommended explicit LND unlock password file path under `onchain/` (example: `onchain/lnd/mainnet/maker/wallet.pw`)
+- `ln.wallet_password_file`: recommended explicit LND unlock password file path under `onchain/` (example: `onchain/lnd/mainnet/maker.wallet-password.txt`)
 - optional: `receipts.db`, `ln.*`, `solana.*` (only needed for tools that touch those subsystems)
 - trade automation bootstrap (optional):
   - `server.tradeauto_autostart` (default `true`) starts backend trade automation automatically on promptd startup.

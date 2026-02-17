@@ -39,14 +39,24 @@ const HEX_D = 'd'.repeat(64);
 const SAMPLE_BOLT11 =
   'lnbc10u1p5ce630pp5gglk6e39yfc625szvf6r0f68pthe2u5gxyk32qagrhurfnpx4ycqdygwfn8zttjvecj6vfhxucrsdpjxyurzde5xqkkzde4vyunscmy95cnwdes8q6ryd3hxycnzdpqf9h8getjvdhk6grnwashqgrjvecj6vfhxucrsdpjxyurzde5xqkkzde4vyunscmycqzzsxqrrsssp5fumz3pfmg3r9w5f4tgc6ey3k2tlleyys0cgneygh4x8fx5462s4s9qxpqysgqanr2qws7jwl8plyveue9h8jec7q08580xys2u3tcrjzewuxh40z3lp9m5ysg9gv2430k82q4kdpqc3t2yfwmtglq3k3u9363gm9u37qqypaxzl';
 
-const SYSTEM_TOOLCALL =
-  'You are functionGemma in IntercomSwap tool-calling mode. Always emit schema-valid tool calls. For invalid user payloads, explain what is invalid and do not call tools.';
+const FUNCTIONGEMMA_TRIGGER = 'You are a model that can do function calling with the following functions';
+const PASSWORD_FILE_PREFERRED = 'onchain/lnd/mainnet/maker.wallet-password.txt';
+const PASSWORD_FILE_MISSING = 'onchain/lnd/mainnet/missing.wallet-password.txt';
 
-const SYSTEM_TRADE_INTENT =
-  'You are functionGemma in IntercomSwap prompt intent mode. Direction mapping is strict: sell BTC/sats means RFQ; buy BTC/sats means Offer. Never invert direction, even when user labels offer/rfq incorrectly. Convert BTC->sats and USDT->6-decimal atomic strings.';
+const SYSTEM_TOOLCALL = `${FUNCTIONGEMMA_TRIGGER}
+Return only valid IntercomSwap function calls.
+If required arguments are missing/invalid, ask for corrected arguments and do not call a function.`;
 
-const SYSTEM_OPS_INTENT =
-  'You are functionGemma in IntercomSwap operations intent mode. Map natural-language operator requests to deterministic tools. If a request is ambiguous/unsafe or missing required values, ask clarification and do not execute.';
+const SYSTEM_TRADE_INTENT = `${FUNCTIONGEMMA_TRIGGER}
+IntercomSwap trade intent mapping is strict:
+- sell BTC/sats for USDT => RFQ path (intercomswap_rfq_post)
+- buy BTC/sats with USDT => Offer path (intercomswap_offer_post)
+- repeating requests => intercomswap_autopost_start with the correct nested tool
+Never invert direction. Convert BTC to sats and USDT to 6-decimal atomic strings.`;
+
+const SYSTEM_OPS_INTENT = `${FUNCTIONGEMMA_TRIGGER}
+Map IntercomSwap operator requests to deterministic functions.
+If a request is ambiguous/unsafe or missing required values, ask clarification and do not execute.`;
 
 function isObject(v) {
   return v && typeof v === 'object' && !Array.isArray(v);
@@ -123,7 +133,7 @@ function sampleString(key = '', schema = {}, mode = 'typical') {
   if (k === 'name') return mode === 'alt' ? 'maker_beta' : 'maker_alpha';
   if (k === 'store' || k === 'peer_store') return mode === 'alt' ? 'taker_store' : 'maker_store';
   if (k === 'compose_file') return 'dev/lnd-regtest/docker-compose.yml';
-  if (k === 'password_file') return 'onchain/lnd/mainnet/wallet.pw';
+  if (k === 'password_file') return PASSWORD_FILE_PREFERRED;
   if (k === 'db') return 'onchain/receipts/mainnet.sqlite';
   if (k === 'keypair_path' || k === 'out') return 'onchain/solana/keys/signer.json';
   if (k === 'log_path') return 'onchain/logs/peer-maker.log';
@@ -315,7 +325,7 @@ function toolCall(id, name, args) {
         type: 'function',
         function: {
           name,
-          arguments: JSON.stringify(args),
+          arguments: deepClone(args || {}),
         },
       },
     ],
@@ -1169,8 +1179,8 @@ function addOpsIntentSamples(records) {
       calls: [['intercomswap_ln_withdraw', { address: 'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh', amount_sats: 25000 }]],
     },
     {
-      prompt: 'unlock lnd with onchain/lnd/mainnet/wallet.pw',
-      calls: [['intercomswap_ln_unlock', { password_file: 'onchain/lnd/mainnet/wallet.pw', timeout_ms: 30000 }]],
+      prompt: `unlock lnd with ${PASSWORD_FILE_PREFERRED}`,
+      calls: [['intercomswap_ln_unlock', { password_file: PASSWORD_FILE_PREFERRED, timeout_ms: 30000 }]],
     },
     {
       prompt: 'show signer and usdt balance',
@@ -1278,8 +1288,8 @@ function addOpsIntentSamples(records) {
     },
     {
       user: 'unlock lnd wallet',
-      first: ['intercomswap_ln_unlock', { password_file: 'onchain/lnd/mainnet/missing.pw' }, { ok: false, error: 'password file not found' }],
-      second: ['intercomswap_ln_unlock', { password_file: 'onchain/lnd/mainnet/wallet.pw' }, { ok: true, unlocked: true }],
+      first: ['intercomswap_ln_unlock', { password_file: PASSWORD_FILE_MISSING }, { ok: false, error: 'password file not found' }],
+      second: ['intercomswap_ln_unlock', { password_file: PASSWORD_FILE_PREFERRED }, { ok: true, unlocked: true }],
       third: null,
       final: 'Unlock succeeded with corrected password file path.',
     },
@@ -1340,8 +1350,122 @@ function normalizeRecord(r, fallbackPrefix = 'seed') {
   const id = String(r?.id || '').trim() || `${fallbackPrefix}_${crypto.randomUUID()}`;
   const source = String(r?.source || 'seed');
   const scenario = String(r?.scenario || 'seed');
-  const tools = Array.isArray(r?.tools) ? r.tools : [];
-  const messages = Array.isArray(r?.messages) ? r.messages : [];
+
+  const replaceLegacyPasswordPath = (text) =>
+    String(text ?? '')
+      .replaceAll('onchain/lnd/mainnet/wallet.pw', PASSWORD_FILE_PREFERRED)
+      .replaceAll('onchain/lnd/mainnet/missing.pw', PASSWORD_FILE_MISSING)
+      .replaceAll('wallet.pw', 'maker.wallet-password.txt')
+      .replaceAll('missing.pw', 'missing.wallet-password.txt');
+
+  const sanitizeValue = (value) => {
+    if (typeof value === 'string') return replaceLegacyPasswordPath(value);
+    if (Array.isArray(value)) return value.map((v) => sanitizeValue(v));
+    if (isObject(value)) {
+      const out = {};
+      for (const [k, v] of Object.entries(value)) out[k] = sanitizeValue(v);
+      return out;
+    }
+    return value;
+  };
+
+  const parseToolArgs = (raw) => {
+    if (isObject(raw)) return sanitizeValue(raw);
+    if (typeof raw === 'string') {
+      const s = raw.trim();
+      if (!s) return {};
+      try {
+        const parsed = JSON.parse(s);
+        if (isObject(parsed)) return sanitizeValue(parsed);
+      } catch (_e) {
+        // ignore
+      }
+    }
+    return {};
+  };
+
+  const normalizedSource = source.toLowerCase();
+  const normalizedScenario = scenario.toLowerCase();
+  const systemPrompt =
+    normalizedSource.includes('ops_intent') || normalizedScenario.startsWith('ops_')
+      ? SYSTEM_OPS_INTENT
+      : normalizedSource.includes('trade_intent') ||
+          normalizedScenario.startsWith('trade_') ||
+          normalizedScenario.startsWith('intent_')
+        ? SYSTEM_TRADE_INTENT
+        : SYSTEM_TOOLCALL;
+
+  const toolsRaw = Array.isArray(r?.tools) ? r.tools : [];
+  const tools = sanitizeValue(toolsRaw);
+
+  const messagesRaw = Array.isArray(r?.messages) ? r.messages : [];
+  const messages = [];
+  let insertedSystem = false;
+  for (const msg of messagesRaw) {
+    if (!isObject(msg)) continue;
+    const role = String(msg.role || '').trim().toLowerCase();
+    if (role === 'system' || role === 'developer') {
+      if (!insertedSystem) {
+        messages.push({ role: 'system', content: systemPrompt });
+        insertedSystem = true;
+      }
+      continue;
+    }
+    if (role === 'assistant') {
+      const out = { role: 'assistant' };
+      if (typeof msg.content === 'string' && msg.content.trim()) {
+        out.content = replaceLegacyPasswordPath(msg.content);
+      }
+      if (Array.isArray(msg.tool_calls)) {
+        const calls = [];
+        for (let i = 0; i < msg.tool_calls.length; i += 1) {
+          const tc = msg.tool_calls[i];
+          if (!isObject(tc)) continue;
+          const fn = isObject(tc.function) ? tc.function : {};
+          const name =
+            (typeof fn.name === 'string' && fn.name.trim()) ||
+            (typeof tc.name === 'string' && tc.name.trim()) ||
+            '';
+          if (!name) continue;
+          calls.push({
+            id: typeof tc.id === 'string' && tc.id.trim() ? tc.id : `call_${id}_${i}`,
+            type: 'function',
+            function: {
+              name,
+              arguments: parseToolArgs(fn.arguments ?? tc.arguments),
+            },
+          });
+        }
+        if (calls.length > 0) out.tool_calls = calls;
+      }
+      if (out.content || out.tool_calls) messages.push(out);
+      continue;
+    }
+
+    if (role === 'tool') {
+      const out = {
+        role: 'tool',
+        tool_call_id: typeof msg.tool_call_id === 'string' ? msg.tool_call_id : '',
+        name: typeof msg.name === 'string' ? msg.name : '',
+      };
+      if (typeof msg.content === 'string') out.content = replaceLegacyPasswordPath(msg.content);
+      else out.content = JSON.stringify(sanitizeValue(msg.content ?? {}));
+      messages.push(out);
+      continue;
+    }
+
+    if (role === 'user') {
+      messages.push({
+        role: 'user',
+        content: replaceLegacyPasswordPath(typeof msg.content === 'string' ? msg.content : JSON.stringify(sanitizeValue(msg.content ?? ''))),
+      });
+      continue;
+    }
+  }
+
+  if (!insertedSystem) {
+    messages.unshift({ role: 'system', content: systemPrompt });
+  }
   return { id, source, scenario, tools, messages };
 }
 
@@ -1406,10 +1530,11 @@ function main() {
     seed.push(...rows);
   }
 
-  const generated = [];
-  addToolSamples(generated);
-  addTradeIntentSamples(generated);
-  addOpsIntentSamples(generated);
+  const generatedRaw = [];
+  addToolSamples(generatedRaw);
+  addTradeIntentSamples(generatedRaw);
+  addOpsIntentSamples(generatedRaw);
+  const generated = generatedRaw.map((r, idx) => normalizeRecord(r, `generated_${idx}`));
 
   const all = dedupe([...seed, ...generated]);
   const { train, eval: evalSet } = splitTrainEval(all);
@@ -1442,4 +1567,3 @@ function main() {
 }
 
 main();
-

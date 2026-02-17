@@ -36,6 +36,18 @@ cd learn-data/functionGemma
 unzip -o training-corpus.zip
 ```
 
+## Runtime Integration Notes (IntercomSwap)
+If this model family is selected for prompting in IntercomSwap:
+1. Set `llm.model` to your FunctionGemma checkpoint id/path.
+2. Set `llm.call_style` to `functiongemma` (or omit it and let promptd auto-detect when model name contains `functiongemma`).
+3. Set `llm.prompt_profile` to `functiongemma_minimal`.
+4. Set `llm.tool_schema_profile` to `minimal`.
+5. Avoid forcing `llm.response_format` JSON mode unless your serving backend requires it.
+
+Prompt contract reminder:
+1. System prompt should include the exact trigger phrase used in this corpus: `You are a model that can do function calling with the following functions`.
+2. Parser should accept FunctionGemma call formats like `call:tool({...})` and `<start_function_call>...<end_function_call>`.
+
 ## Phases
 
 ### Phase 1: Tool-Schema Grounding

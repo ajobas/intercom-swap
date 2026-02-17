@@ -2,7 +2,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 
 import { buildIntercomswapSystemPrompt } from './system.js';
 import { INTERCOMSWAP_TOOLS } from './tools.js';
-import { compactToolsForModel } from './toolsCompact.js';
+import { normalizeToolSchemaProfile, toolsForModelProfile } from './toolsCompact.js';
 import { OpenAICompatibleClient } from './openaiClient.js';
 import { AuditLog } from './audit.js';
 import { SecretStore, isSecretHandle } from './secrets.js';
@@ -34,12 +34,27 @@ function parseSatsForUsdt(prompt) {
   // Only handle narrow, explicit phrases. If this doesn't match, we fall back to the LLM.
   // Examples:
   // - "sell 1002 sats for 0.33 usdt"
+  // - "buy 0.1 btc for 1000 usdt"
   // - "buy 1002 sats for 0.33 usdt"
-  const mSats = p.match(/\b(sell|buy)\s+(\d+)\s*(sat|sats)\b/i);
+  const mSats = p.match(/\b(sell|buy)\s+([0-9]+(?:\.[0-9]+)?)\s*(sat|sats|satoshi|satoshis|btc)\b/i);
   const mUsdt = p.match(/\bfor\s+([0-9]+(?:\.[0-9]+)?)\s*usdt\b/i);
   if (!mSats || !mUsdt) return null;
   const verb = String(mSats[1] || '').toLowerCase();
-  const sats = Number.parseInt(String(mSats[2] || ''), 10);
+  const amountRaw = String(mSats[2] || '').trim();
+  const amountUnit = String(mSats[3] || '').toLowerCase();
+  let sats = null;
+  if (amountUnit.startsWith('sat')) {
+    if (!/^\d+$/.test(amountRaw)) return null;
+    sats = Number.parseInt(amountRaw, 10);
+  } else if (amountUnit === 'btc') {
+    if (!/^\d+(?:\.\d+)?$/.test(amountRaw)) return null;
+    const [i, f = ''] = amountRaw.split('.');
+    if (f.length > 8) return null;
+    const frac = `${f}00000000`.slice(0, 8);
+    const out = BigInt(i) * 100_000_000n + BigInt(frac);
+    if (out < 1n || out > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    sats = Number(out);
+  }
   const usdt = String(mUsdt[1] || '').trim();
   if (!Number.isFinite(sats) || !Number.isInteger(sats) || sats < 1) return null;
   if (!usdt || !/^[0-9]+(?:\.[0-9]+)?$/.test(usdt)) return null;
@@ -224,8 +239,7 @@ function tryParseArgsObject(value) {
   return { ok: false, args: null };
 }
 
-// Fallback for models/servers that "describe" a tool call instead of returning tool_calls.
-function extractToolCallFromText(content, { allowedNames }) {
+function extractToolCallFromJsonText(content, { allowedNames }) {
   const chunks = extractJsonObjects(content);
   const candidates = [];
   for (const chunk of chunks) {
@@ -330,6 +344,157 @@ function extractToolCallFromText(content, { allowedNames }) {
   };
 }
 
+function normalizeFunctionGemmaArgsText(raw) {
+  let s = String(raw ?? '');
+  s = s.replace(/<\/?escape>/gi, '"');
+  s = s.replace(/<start_function_call>/gi, '');
+  s = s.replace(/<end_function_call>/gi, '');
+  s = s.replace(/<start_function_response>/gi, '');
+  s = s.replace(/<end_function_response>/gi, '');
+  s = s.replace(/<bos>/gi, '');
+  s = s.replace(/<eos>/gi, '');
+  return s.trim();
+}
+
+function tryParseLooseObjectText(raw) {
+  let s = normalizeFunctionGemmaArgsText(raw);
+  if (!s.startsWith('{') || !s.endsWith('}')) return { ok: false, args: null };
+
+  // Quote bare object keys.
+  s = s.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_.-]*)(\s*:)/g, '$1"$2"$3');
+
+  // Quote bare string-like scalar values while preserving literals.
+  s = s.replace(/:\s*([A-Za-z_][A-Za-z0-9_.-]*)(\s*[,}])/g, (_m, token, suffix) => {
+    const low = String(token || '').toLowerCase();
+    if (low === 'true' || low === 'false' || low === 'null') return `:${low}${suffix}`;
+    return `:"${token}"${suffix}`;
+  });
+
+  // Remove dangling commas.
+  s = s.replace(/,\s*([}\]])/g, '$1');
+
+  const parsed = safeJsonParse(s);
+  if (parsed.ok && isObject(parsed.value)) return { ok: true, args: parsed.value };
+  return { ok: false, args: null };
+}
+
+function parseFunctionGemmaArgsObject(raw) {
+  let cleaned = normalizeFunctionGemmaArgsText(raw);
+  // Some FunctionGemma-style outputs wrap JSON args with an extra outer brace
+  // (e.g. call:tool{{"k":1}}). Peel only the redundant wrapper.
+  while (/^\{\s*\{[\s\S]*\}\s*\}$/.test(cleaned)) {
+    cleaned = cleaned.slice(1, -1).trim();
+  }
+  if (!cleaned) return { ok: true, args: {} };
+  const parsed = safeJsonParse(cleaned);
+  if (parsed.ok && isObject(parsed.value)) return { ok: true, args: parsed.value };
+  return tryParseLooseObjectText(cleaned);
+}
+
+function extractBalancedSegment(text, start, openCh, closeCh) {
+  const s = String(text ?? '');
+  if (start < 0 || start >= s.length) return null;
+  if (s[start] !== openCh) return null;
+  let depth = 0;
+  let inString = false;
+  let esc = false;
+  for (let i = start; i < s.length; i += 1) {
+    const ch = s[i];
+    if (inString) {
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === '\\') {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === openCh) depth += 1;
+    if (ch === closeCh) {
+      depth -= 1;
+      if (depth === 0) {
+        return {
+          start,
+          end: i + 1,
+          inner: s.slice(start + 1, i),
+          raw: s.slice(start, i + 1),
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function extractToolCallFromFunctionGemmaText(content, { allowedNames }) {
+  const s = String(content ?? '');
+  if (!s.trim()) return null;
+
+  // Accept:
+  // - <start_function_call>my_tool({...})<end_function_call>
+  // - <start_function_call>call:my_tool({...})<end_function_call>
+  // - call:my_tool({...})
+  // - call:my_tool{...}
+  const re = /(<start_function_call>\s*)?(call\s*:\s*)?([A-Za-z][A-Za-z0-9_.-]*)\s*(\(|\{)/g;
+  const candidates = [];
+  let m = null;
+  while ((m = re.exec(s)) !== null) {
+    const hasStartTag = Boolean(m[1]);
+    const hasCallPrefix = Boolean(m[2]);
+    const name = String(m[3] || '').trim();
+    const openCh = m[4] === '{' ? '{' : '(';
+    const closeCh = openCh === '{' ? '}' : ')';
+    if (!hasStartTag && !hasCallPrefix) continue;
+    if (!name || !allowedNames || !allowedNames.has(name)) continue;
+
+    const openIdx = re.lastIndex - 1;
+    const seg = extractBalancedSegment(s, openIdx, openCh, closeCh);
+    if (!seg) continue;
+
+    const argsRaw = openCh === '{' ? seg.raw : seg.inner.trim();
+    const parsed = parseFunctionGemmaArgsObject(argsRaw);
+    if (parsed.ok) {
+      candidates.push({
+        id: '',
+        name,
+        arguments: parsed.args,
+        argumentsRaw: safeJsonStringify(parsed.args),
+        parseError: null,
+        fromText: true,
+      });
+    }
+    re.lastIndex = seg.end;
+  }
+
+  if (candidates.length === 0) return null;
+  return candidates[candidates.length - 1];
+}
+
+// Fallback for models/servers that "describe" a tool call instead of returning tool_calls.
+function extractToolCallFromText(content, { allowedNames, callStyle = 'openai' }) {
+  const style = String(callStyle || '').trim().toLowerCase() === 'functiongemma' ? 'functiongemma' : 'openai';
+  if (style === 'functiongemma') {
+    const fg = extractToolCallFromFunctionGemmaText(content, { allowedNames });
+    if (fg) return fg;
+  }
+
+  const json = extractToolCallFromJsonText(content, { allowedNames });
+  if (json) return json;
+
+  if (style !== 'functiongemma') {
+    return extractToolCallFromFunctionGemmaText(content, { allowedNames });
+  }
+  return null;
+}
+
 function shouldSealKey(key) {
   const k = String(key || '').toLowerCase();
   if (k.includes('preimage')) return true;
@@ -416,6 +581,10 @@ export class PromptRouter {
 
     const cfg = llmConfig;
     this.llmConfig = cfg;
+    this.callStyle = String(cfg.callStyle || '').trim().toLowerCase() === 'functiongemma' ? 'functiongemma' : 'openai';
+    this.promptProfile =
+      String(cfg.promptProfile || '').trim().toLowerCase() === 'functiongemma_minimal' ? 'functiongemma_minimal' : 'default';
+    this.toolSchemaProfile = normalizeToolSchemaProfile(cfg.toolSchemaProfile, { fallback: 'compact' });
 
     this.llmClient =
       llmClient ||
@@ -434,7 +603,7 @@ export class PromptRouter {
     const id = sessionId || randomUUID();
     if (!this._sessions.has(id)) {
       this._sessions.set(id, {
-        messages: [{ role: 'system', content: buildIntercomswapSystemPrompt({ role: this.agentRole }) }],
+        messages: [{ role: 'system', content: buildIntercomswapSystemPrompt({ role: this.agentRole, profile: this.promptProfile }) }],
         secrets: new SecretStore(),
       });
     }
@@ -528,12 +697,14 @@ export class PromptRouter {
       toolsAll.map((t) => t?.function?.name).filter((n) => typeof n === 'string' && n.trim())
     );
 
-    const toolsCompactEnabled = this.llmConfig?.toolsCompact !== false; // default true
-    const toolsCompactOpts = {
+    const toolsSchemaOpts = {
       keepToolDescriptions: this.llmConfig?.toolsCompactKeepToolDescriptions !== false, // default true
       keepSchemaDescriptions: Boolean(this.llmConfig?.toolsCompactKeepSchemaDescriptions), // default false
     };
-    const toolsForModelAll = toolsCompactEnabled ? compactToolsForModel(toolsAll, toolsCompactOpts) : toolsAll;
+    const toolsForModelAll = toolsForModelProfile(toolsAll, {
+      profile: this.toolSchemaProfile,
+      ...toolsSchemaOpts,
+    });
     let toolsForModel = toolsForModelAll;
     let allowedToolNames = new Set(
       toolsForModel.map((t) => t?.function?.name).filter((n) => typeof n === 'string' && n.trim())
@@ -638,7 +809,10 @@ export class PromptRouter {
         if (Array.isArray(selected) && selected.length > 0) {
           const keep = new Set(selected);
           const filteredAll = toolsAll.filter((t) => keep.has(t?.function?.name));
-          const filteredModel = toolsCompactEnabled ? compactToolsForModel(filteredAll, toolsCompactOpts) : filteredAll;
+          const filteredModel = toolsForModelProfile(filteredAll, {
+            profile: this.toolSchemaProfile,
+            ...toolsSchemaOpts,
+          });
           if (filteredModel.length > 0) {
             toolsForModel = filteredModel;
             allowedToolNames = new Set(
@@ -704,7 +878,10 @@ export class PromptRouter {
               if (Array.isArray(selected) && selected.length > 0) {
                 const keep = new Set(selected);
                 const filteredAll = toolsAll.filter((t) => keep.has(t?.function?.name));
-                const filteredModel = toolsCompactEnabled ? compactToolsForModel(filteredAll, toolsCompactOpts) : filteredAll;
+                const filteredModel = toolsForModelProfile(filteredAll, {
+                  profile: this.toolSchemaProfile,
+                  ...toolsSchemaOpts,
+                });
                 if (filteredModel.length > 0) {
                   toolsForModel = filteredModel;
                   allowedToolNames = new Set(
@@ -725,7 +902,10 @@ export class PromptRouter {
       // Some servers/models don't emit tool_calls reliably. If the assistant content contains a
       // structured tool call JSON object ({name,arguments}), treat it as a tool call.
       if ((!Array.isArray(llmOut.toolCalls) || llmOut.toolCalls.length === 0) && llmOut.content) {
-        const fallback = extractToolCallFromText(llmOut.content, { allowedNames: allowedToolNames });
+        const fallback = extractToolCallFromText(llmOut.content, {
+          allowedNames: allowedToolNames,
+          callStyle: this.callStyle,
+        });
         if (fallback) {
           // Synthesize a real OpenAI-style tool_calls message so the model reliably
           // receives the tool result in the next turn (tool_call_id correlation).
