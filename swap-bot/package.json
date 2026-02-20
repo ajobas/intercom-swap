@@ -1,0 +1,13 @@
+{
+  "name": "pancakeswap-bot",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node scripts/deploy.js"
+  },
+  "dependencies": {
+    "ethers": "^5.7.2",
+    "dotenv": "^16.0.3"
+  }
+}
